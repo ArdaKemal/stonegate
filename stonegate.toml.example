@@ -1,0 +1,80 @@
+# Copy to stonegate.toml and create public/ beside it.
+# Split sites into exact include paths if desired:
+# include = ["sites/docs.toml", "sites/downloads.toml"]
+
+[runtime]
+shutdown_seconds = 5        # How long SIGTERM waits for in-flight requests.
+workers = 1                 # Event-loop threads serving every listener.
+worker_mode = "auto"        # reuse_port on Linux, handoff elsewhere.
+# user = "www-data"         # Drop root once listeners are open.
+# group = "www-data"
+
+# Every server inherits these settings. Explicit server fields override them.
+[defaults]
+bind = "127.0.0.1"          # Use "0.0.0.0" to listen on every IPv4 interface.
+directory_listing = false
+reuse_port = false
+header_timeout_ms = 30_000
+idle_timeout_ms = 60_000
+# access_log = "logs/access.log"   # "-" for standard output; SIGHUP reopens it.
+# real_ip_header = "x-forwarded-for" # Behind a trusted proxy only.
+
+[defaults.http]
+mode = "serve"             # "serve", "redirect", or "off"
+port = 8080
+redirect_host = "localhost"
+
+[defaults.tls]
+port = 8443                # 0 disables TCP TLS; credentials enable it otherwise.
+http2 = true
+
+[defaults.http3]
+port = 0                   # UDP; may share a port number with TCP TLS.
+connections = 8            # 1..256 per server
+requests = 0               # 0 selects ten scratch slots per connection.
+max_datagram = 8192         # 1200..8192 bytes
+
+[defaults.compression]
+precompressed = false      # Serve FILE.br / FILE.gz when the client accepts them.
+gzip = false               # Compress text, JSON, XML, JS, and SVG while sending.
+
+# Added to every response; inherited fields merge by name.
+# [defaults.headers]
+# "x-content-type-options" = "nosniff"
+# "strict-transport-security" = "max-age=63072000"
+
+[[server]]
+name = "public"
+root = "public"
+# server_names = ["example.com", "www.example.com"]
+
+# Longest /prefix wins, else the longest *.ext suffix.
+# [server.cache_control]
+# "/assets/" = "public, max-age=31536000, immutable"
+# "*.html" = "no-cache"
+
+# [server.error_pages]
+# 404 = "/errors/404.html"
+
+# Enable HTTPS by supplying both files, resolved beside this TOML file;
+# SIGHUP reloads them:
+# [server.tls]
+# certificate = "certs/fullchain.pem"
+# private_key = "certs/privkey.pem"
+# key_password = ""
+#
+# Redirect HTTP to TLS and enable HTTP/3:
+# [server.http]
+# mode = "redirect"
+# redirect_host = "example.com"
+# [server.http3]
+# port = 8443
+
+# A second site on the same ports, picked by host name. Servers sharing
+# listeners must agree on listener settings and use one certificate that
+# covers every name:
+# [[server]]
+# name = "downloads"
+# root = "downloads"
+# server_names = ["downloads.example.com"]
+# directory_listing = true
