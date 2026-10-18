@@ -5,11 +5,11 @@ include(CTest)
 
 # eventloop comes from, in order: a source checkout (EVENTLOOP_SOURCE_DIR), an
 # installed package exporting eventloop::eventloop, or a download of
-# EVENTLOOP_GIT_TAG. Pin the tag to an eventloop release.
+# EVENTLOOP_GIT_TAG, the eventloop release Stonegate is tested with.
 set(EVENTLOOP_SOURCE_DIR "" CACHE PATH "eventloop source checkout to build with Stonegate")
 set(EVENTLOOP_GIT_REPOSITORY "https://github.com/ArdaKemal/eventloop.git" CACHE STRING
     "eventloop repository downloaded when no checkout or package is found")
-set(EVENTLOOP_GIT_TAG "main" CACHE STRING "eventloop tag or commit to download")
+set(EVENTLOOP_GIT_TAG "v0.1.0" CACHE STRING "eventloop tag or commit to download")
 
 if(NOT EVENTLOOP_SOURCE_DIR)
     find_package(eventloop CONFIG QUIET)

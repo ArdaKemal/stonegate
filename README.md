@@ -16,8 +16,8 @@ CMake finds eventloop in this order:
    Stonegate (without eventloop's examples and tests);
 2. an installed package exporting `eventloop::eventloop`, found through
    `CMAKE_PREFIX_PATH`;
-3. a download of `EVENTLOOP_GIT_TAG` (default `main`) from
-   `EVENTLOOP_GIT_REPOSITORY`. Pin the tag to an eventloop release.
+3. a download of `EVENTLOOP_GIT_TAG` (default `v0.1.0`, the release
+   Stonegate is tested with) from `EVENTLOOP_GIT_REPOSITORY`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
