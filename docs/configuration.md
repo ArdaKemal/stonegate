@@ -1,6 +1,6 @@
 # Stonegate configuration
 
-Stonegate reads TOML with eventloop's `eventloop::util::parse_toml`. CLI-only
+Stonegate reads TOML with its own [TOML 1.1 parser](toml.md). CLI-only
 invocations work without a file. A typical deployment is several static sites
 behind one set of ports, picked by host name, with common policy in
 `[defaults]` and sites split into included files.

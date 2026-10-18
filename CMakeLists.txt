@@ -48,6 +48,7 @@ add_executable(stonegate
     src/main.cc
     src/privileges.cc
     src/static_files.cc
+    src/toml.cc
     src/workers.cc)
 find_package(OpenSSL 3.5 REQUIRED COMPONENTS Crypto)
 target_link_libraries(stonegate PRIVATE eventloop::eventloop OpenSSL::Crypto)

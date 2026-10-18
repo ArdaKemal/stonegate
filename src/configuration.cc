@@ -1,8 +1,9 @@
 #include "configuration.h"
 
+#include "toml.h"
+
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/util/arg_parser.h"
-#include "eventloop/util/toml.h"
 
 #include <algorithm>
 #include <array>
@@ -233,9 +234,6 @@ auto apply(server_config& settings, std::string_view key, std::string_view value
     else throw std::invalid_argument("unknown setting");
 }
 
-using eventloop::util::toml_type;
-using eventloop::util::toml_value;
-
 struct setting {
     std::string_view section, key, cli;
     toml_type type;
@@ -360,9 +358,9 @@ auto read_server(server_config& settings, const toml_value& table,
     }
 }
 
-auto toml_error_name(eventloop::util::toml_error_code code) -> std::string_view
+auto toml_error_name(toml_error_code code) -> std::string_view
 {
-    using enum eventloop::util::toml_error_code;
+    using enum toml_error_code;
     switch (code) {
     case invalid_syntax: return "invalid syntax";
     case invalid_utf8: return "invalid UTF-8";
@@ -450,7 +448,7 @@ private:
         // Heap-backed setup buffers avoid large per-include stack frames.
         auto nodes = std::make_unique<toml_value[]>(2048);
         auto strings = std::make_unique<char[]>(max_bytes);
-        const auto document = eventloop::util::parse_toml(input,
+        const auto document = parse_toml(input,
             std::span(nodes.get(), 2048), std::span(strings.get(), max_bytes));
         if (!document) {
             const auto offset = std::min(document.error().offset, input.size());
