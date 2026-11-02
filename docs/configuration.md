@@ -50,6 +50,7 @@ Fields below are allowed under both `defaults` and each `server`.
 | `idle_timeout_ms` | integer | 60000; 0..3600000, 0 disables; TCP only |
 | `access_log` | string path | Empty (off); `-` is standard output |
 | `real_ip_header` | string | Empty; lowercase field such as `x-forwarded-for` |
+| `acme_webroot` | string path | Empty (off); existing directory, see [ACME challenges](#acme-challenges) |
 | `http.mode` | string | `serve`; `serve`, `redirect`, `off` |
 | `http.port` | integer | 8080; 1..65535 |
 | `http.redirect_host` | string | `localhost`; HTTPS redirect host for unnamed hosts |
@@ -101,6 +102,25 @@ TLS certificates are not selected by SNI: servers sharing a TLS listener use
 its one certificate, so it must cover every name (a SAN or wildcard
 certificate). Root, listing, compression, logging, and policy settings stay
 per server.
+
+## ACME challenges
+
+`acme_webroot` names the directory a `certbot certonly --webroot -w DIR` run
+writes to. A GET or HEAD for `/.well-known/acme-challenge/TOKEN` is then
+answered from `DIR/.well-known/acme-challenge/TOKEN` on every listener,
+before an HTTP redirect and before a proxy upstream, so certificates for
+proxied sites can be issued and renewed while HTTP redirects to HTTPS.
+Set it in `[defaults]` to cover every site, or per server; an empty value
+clears it for one server.
+
+TOKEN must be base64url (letters, digits, `-`, `_`); the file must be a
+regular file of at most 64 KiB, and each path component is opened without
+following symbolic links. The answer is 200 with `text/plain` and
+`Cache-Control: no-store`, or 404, never another server's content. The
+webroot is opened at startup, before Stonegate drops root; the challenge
+directories are looked up per request, since certbot may remove and
+recreate them, and its files must be readable to the account Stonegate
+runs as (certbot's default modes are).
 
 ## Reverse proxy
 

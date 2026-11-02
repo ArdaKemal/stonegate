@@ -70,6 +70,9 @@ bound, and rule.
   over every listener protocol. Bodies stream both ways; WebSockets pass
   through from HTTP/1.1 Upgrade, HTTP/2, or HTTP/3 clients; timeouts,
   request body limits, and 502/504 answers are per server.
+- **ACME challenges**: `acme_webroot` answers Let's Encrypt HTTP-01
+  challenges from a certbot webroot before redirects and proxying, so every
+  site, proxied ones included, can get and renew certificates.
 - **Access logs**: Combined Log Format plus host and duration, per server or
   shared, written by a background thread with a bounded buffer.
   Clients are logged by address, or by a trusted proxy's field with
@@ -106,6 +109,22 @@ Certificate renewal hooks and logrotate's `postrotate` run
 `systemctl reload stonegate`. Keep certificate files readable to the account
 Stonegate runs as, since reloads happen after the switch.
 
+Let's Encrypt certificates for every site, proxied ones included, come from
+a certbot webroot. With `acme_webroot = "/var/www/acme"` in `[defaults]`:
+
+```sh
+certbot certonly --webroot -w /var/www/acme \
+  -d example.com -d movies.example.com -d git.example.com \
+  --deploy-hook "systemctl reload stonegate"
+```
+
+Redirect mode needs a certificate to start, so the first issuance runs with
+`http.mode = "serve"` (or without TLS settings); afterwards enable TLS and
+the redirect. Renewals (`certbot renew`) work while HTTP redirects, and the
+deploy hook's reload picks up the new certificate. certbot keeps private
+keys readable only to root, so make them readable to Stonegate's account
+(for example through a group) for reloads after it drops root.
+
 ## Limits
 
 - No SNI: one certificate per TLS listener, as eventloop's `https_server` and
@@ -139,8 +158,8 @@ ranges, listings, traversal, and CLI/config equivalence (HTTP/2 and HTTP/3
 checks need a curl with them). `stonegate_configuration` covers the schema,
 includes, inheritance, timeouts, workers, and startup cleanup.
 `stonegate_features` covers access logs and their rotation, compression,
-virtual hosts, policies and error pages, HTTPS redirects, the reverse proxy
-(framing, limits, upstream failures and resets, client addresses, HTTP/2),
-certificate reload (including a failed one), draining shutdown, encrypted
-HTTP/3 keys, and account checks.
+virtual hosts, policies and error pages, HTTPS redirects, ACME challenges,
+the reverse proxy (framing, limits, upstream failures and resets, client
+addresses, WebSockets, HTTP/2), certificate reload (including a failed
+one), draining shutdown, encrypted HTTP/3 keys, and account checks.
 They need Python 3, the OpenSSL CLI, and curl.

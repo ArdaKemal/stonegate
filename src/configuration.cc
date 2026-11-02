@@ -52,6 +52,7 @@ constexpr std::string_view usage =
     "  --gzip-max-size N       largest file to gzip (default 8388608)\n"
     "  --access-log FILE       append access log lines to FILE (- for stdout)\n"
     "  --real-ip-header NAME   log the first address of this request field\n"
+    "  --acme-webroot DIR      answer /.well-known/acme-challenge/ from a certbot webroot\n"
     "  --proxy-upstream URL    forward requests to http://ADDRESS[:PORT] instead of root\n"
     "  --proxy-timeout-ms N    upstream connect/read/write timeout (1..3600000; default 60000)\n"
     "  --proxy-max-request-body N  largest forwarded request body (default 1048576)\n"
@@ -230,7 +231,7 @@ auto apply(server_config& settings, std::string_view key, std::string_view value
     };
     if (value.empty() && key != "certificate" && key != "private-key" &&
         key != "key-password" && key != "access-log" && key != "real-ip-header" &&
-        key != "proxy-upstream")
+        key != "proxy-upstream" && key != "acme-webroot")
         throw std::invalid_argument(std::string(key) + " has an empty value");
     if (key == "root") settings.root = path_value();
     else if (key == "bind") settings.bind = value;
@@ -264,6 +265,7 @@ auto apply(server_config& settings, std::string_view key, std::string_view value
             throw std::invalid_argument("server-name capacity exhausted (16)");
         settings.server_names.emplace_back(value);
     } else if (key == "access-log") settings.access_log = value == "-" ? "-" : path_value();
+    else if (key == "acme-webroot") settings.acme_webroot = path_value();
     else if (key == "real-ip-header") {
         if (!value.empty() && !lowercase_token(value))
             throw std::invalid_argument("real-ip-header must be a lowercase field name");
@@ -296,6 +298,7 @@ constexpr setting schema[] {
     {"", "idle_timeout_ms", "idle-timeout-ms", toml_type::integer},
     {"", "access_log", "access-log", toml_type::string},
     {"", "real_ip_header", "real-ip-header", toml_type::string},
+    {"", "acme_webroot", "acme-webroot", toml_type::string},
     {"http", "mode", "http-mode", toml_type::string},
     {"http", "port", "http-port", toml_type::integer},
     {"http", "redirect_host", "redirect-host", toml_type::string},
@@ -569,6 +572,9 @@ auto validate(const server_config& settings) -> void
             [](unsigned char byte) { return byte <= 32 || byte == 127; }) ||
         settings.redirect_host.find_first_of("/\\@?#") != std::string::npos)
         throw std::invalid_argument("redirect-host must be a hostname without whitespace or URL syntax");
+    if (!settings.acme_webroot.empty() &&
+        !std::filesystem::is_directory(settings.acme_webroot, root_error))
+        throw std::invalid_argument("acme-webroot must name an existing directory");
     if (settings.gzip && !gzip_available)
         throw std::invalid_argument("gzip needs a Stonegate build with zlib");
     if (settings.gzip_min_size > settings.gzip_max_size)

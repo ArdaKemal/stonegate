@@ -80,6 +80,13 @@ auto build_groups(const configuration& configuration, access_logs& logs)
                 throw std::system_error(errno, std::generic_category(),
                                         "server " + settings.name + ": open root");
         }
+        if (!settings.acme_webroot.empty()) {
+            member.acme_webroot = eventloop::unique_fd(::open(settings.acme_webroot.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (!member.acme_webroot)
+                throw std::system_error(errno, std::generic_category(),
+                                        "server " + settings.name + ": open acme_webroot");
+        }
         if (!settings.access_log.empty()) member.log = logs.open(settings.access_log);
         (*existing)->sites.sites.push_back(std::move(member));
     }
