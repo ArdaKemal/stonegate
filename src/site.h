@@ -33,6 +33,12 @@ struct site_group {
     std::size_t fallback {0};
 
     [[nodiscard]] auto select(std::string_view authority) const noexcept -> const site&;
+    // The request host, lowercase and without port or trailing dot, when it
+    // matches a server_names entry; empty otherwise.
+    [[nodiscard]] auto named_host(std::string_view authority) const -> std::string;
+
+private:
+    [[nodiscard]] auto match(std::string_view host) const noexcept -> const site*;
 };
 
 // What a route handler knows about the listener that took the request.
@@ -42,9 +48,12 @@ struct listener_context {
     bool secure {false};
     // Alt-Svc value for file responses on TLS TCP listeners; empty otherwise.
     std::string alt_svc;
-    // "https://host[:port]" when a plain listener redirects every request
-    // there, keeping its path and query; empty otherwise.
+    // "https://redirect_host[:port]" when a plain listener redirects every
+    // request, keeping its path and query; empty otherwise. A request whose
+    // host matches a server name keeps that host instead.
     std::string redirect_origin;
+    // ":port" after a redirect host, or empty for 443.
+    std::string redirect_port;
 };
 
 } // namespace stonegate

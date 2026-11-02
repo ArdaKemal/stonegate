@@ -95,9 +95,10 @@ auto build_groups(const configuration& configuration, access_logs& logs)
         if (settings.http3_port != 0)
             group->secure.alt_svc = "h3=\":" + std::to_string(settings.http3_port) + "\"; ma=86400";
         if (settings.mode == server_config::http_mode::redirect) {
-            group->plain.redirect_origin = "https://" + settings.redirect_host;
             if (settings.https_port != 443)
-                group->plain.redirect_origin += ":" + std::to_string(settings.https_port);
+                group->plain.redirect_port = ":" + std::to_string(settings.https_port);
+            group->plain.redirect_origin =
+                "https://" + settings.redirect_host + group->plain.redirect_port;
         }
         group->plain_routes = make_router(group->plain);
         group->secure_routes = make_router(group->secure);

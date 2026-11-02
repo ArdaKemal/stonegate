@@ -52,7 +52,7 @@ Fields below are allowed under both `defaults` and each `server`.
 | `real_ip_header` | string | Empty; lowercase field such as `x-forwarded-for` |
 | `http.mode` | string | `serve`; `serve`, `redirect`, `off` |
 | `http.port` | integer | 8080; 1..65535 |
-| `http.redirect_host` | string | `localhost`; hostname for HTTPS redirects |
+| `http.redirect_host` | string | `localhost`; HTTPS redirect host for unnamed hosts |
 | `tls.port` | integer | 8443; 0..65535, 0 disables TCP TLS |
 | `tls.certificate` | string path | PEM certificate chain; empty clears inheritance |
 | `tls.private_key` | string path | PEM key; empty clears inheritance |
@@ -162,7 +162,11 @@ Static servers answer every request themselves: `GET /healthz` returns
 `ok`, `GET` and `HEAD` serve files, `OPTIONS` answers 204 with `Allow: GET,
 HEAD, OPTIONS`, and `POST`, `PUT`, `DELETE`, `PATCH`, and `TRACE` answer 405. With
 `http.mode = "redirect"` the plain listener answers every request with 308
-to `https://redirect_host[:tls.port]` plus the request path and query.
+to `https://HOST[:tls.port]` plus the request path and query. HOST is the
+request host, lowercase and without its port, when it matches a
+`server_names` entry of the servers sharing the listener (exact or
+wildcard), and `redirect_host` otherwise, so an unknown host never chooses
+the redirect target.
 
 Files keep eventloop's static-file rules: weak ETags from size, nanosecond
 mtime/ctime, and file identity; `If-None-Match` before `If-Modified-Since`
