@@ -872,6 +872,81 @@ root = "public"
     print(f"WebSocket proxying over HTTP/1.1, TLS, and HTTP/2: PASS{note}")
 
 
+def test_acme_challenge(work):
+    port, tls_port = free_ports(2)
+    backend = Backend(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    cert, key = make_certificate(work, "acme")
+    webroot = work / "acme"
+    challenges = webroot / ".well-known" / "acme-challenge"
+    challenges.mkdir(parents=True)
+    (challenges / "tok_en-1").write_text("tok_en-1.thumbprint")
+    (challenges / "link").symlink_to(challenges / "tok_en-1")
+    (challenges / "folder").mkdir()
+    config = work / "acme.toml"
+    config.write_text(f'''[defaults]
+acme_webroot = "acme"
+[defaults.http]
+port = {port}
+mode = "redirect"
+redirect_host = "app.test"
+[defaults.tls]
+port = {tls_port}
+certificate = "{cert}"
+private_key = "{key}"
+
+[[server]]
+name = "app"
+server_names = ["app.test"]
+[server.proxy]
+upstream = "http://127.0.0.1:{backend.server_address[1]}"
+
+[[server]]
+name = "plain"
+server_names = ["plain.test"]
+root = "public"
+acme_webroot = ""
+
+[[server]]
+name = "static"
+root = "public"
+''')
+    path = "/.well-known/acme-challenge/"
+    app = {"Host": "app.test"}
+    with running(work, config) as server:
+        server.ready(tls_port, tls=True)
+        # Plain HTTP answers the challenge instead of redirecting, for the
+        # proxied site and for the fallback static site.
+        for host in ("app.test", "static.test"):
+            status, fields, body = fetch(port, path + "tok_en-1", {"Host": host})
+            assert (status, body) == (200, b"tok_en-1.thumbprint"), (host, status, body)
+            assert fields["content-type"] == "text/plain" and fields["cache-control"] == "no-store"
+        status, _, body = fetch(port, path + "tok_en-1", app, method="HEAD")
+        assert (status, body) == (200, b""), status
+        for token in ("missing", "link", "folder", "..%2Ftok_en-1", "a.b", ""):
+            status, fields, _ = fetch(port, path + token, app)
+            assert status == 404 and "location" not in fields, (token, status)
+        status, fields, _ = fetch(port, "/elsewhere", app)
+        assert status == 308 and fields["location"] == f"https://app.test:{tls_port}/elsewhere"
+        assert fetch(port, path + "tok_en-1", app, method="POST")[0] == 308
+        # A server that clears the setting keeps redirecting challenges.
+        assert fetch(port, path + "tok_en-1", {"Host": "plain.test"})[0] == 308
+        # Over HTTPS the proxied site still answers challenges itself.
+        status, _, body = fetch(tls_port, path + "tok_en-1", app, tls=True)
+        assert (status, body) == (200, b"tok_en-1.thumbprint"), (status, body)
+        assert fetch(tls_port, "/echo", app, tls=True)[2].startswith(b"GET /echo")
+        # certbot may remove the challenge directories between runs.
+        shutil.rmtree(webroot / ".well-known")
+        assert fetch(port, path + "tok_en-1", app)[0] == 404
+        challenges.mkdir(parents=True)
+        (challenges / "second").write_text("second.thumbprint")
+        assert fetch(port, path + "second", app)[2] == b"second.thumbprint"
+    backend.shutdown()
+    check_config(work, '[defaults]\nroot = "public"\nacme_webroot = "missing"\n',
+                 "acme-webroot must name an existing directory")
+    print("ACME HTTP-01 challenges before redirects and proxying: PASS")
+
+
 def test_redirect_keeps_named_host(work):
     port, tls_port = free_ports(2)
     cert, key = make_certificate(work, "redirect")
@@ -1088,6 +1163,7 @@ def main(work):
     test_reverse_proxy(work)
     test_websocket_proxy(work)
     test_redirect_keeps_named_host(work)
+    test_acme_challenge(work)
     test_certificate_reload(work)
     test_draining_shutdown(work)
     test_encrypted_http3_key(work)

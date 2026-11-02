@@ -17,6 +17,7 @@ reuse_port = false
 header_timeout_ms = 30_000
 idle_timeout_ms = 60_000
 # access_log = "logs/access.log"   # "-" for standard output; SIGHUP reopens it.
+# acme_webroot = "/var/www/acme"   # certbot --webroot directory for HTTP-01 challenges.
 # real_ip_header = "x-forwarded-for" # Behind a trusted proxy only.
 
 [defaults.http]

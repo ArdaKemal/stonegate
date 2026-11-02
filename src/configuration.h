@@ -60,6 +60,10 @@ struct server_config {
     std::vector<std::string> server_names;
     // Access log path; "-" is standard output and empty disables logging.
     std::string access_log;
+    // Directory a certbot --webroot run writes to; requests for
+    // /.well-known/acme-challenge/TOKEN are answered from it before any
+    // redirect or proxy. Empty disables this.
+    std::string acme_webroot;
     // A request field holding a proxy's client address list, such as
     // x-forwarded-for; its first entry is logged as the client.
     std::string real_ip_header;

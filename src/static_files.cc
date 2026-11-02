@@ -43,6 +43,8 @@ constexpr std::size_t max_decoded_path = 4096;
 constexpr std::size_t listing_max_entries = 4096;
 constexpr std::size_t listing_max_bytes = 1u << 20;
 constexpr std::uint64_t max_error_page = 1u << 20;
+constexpr std::string_view acme_prefix = "/.well-known/acme-challenge/";
+constexpr std::uint64_t max_acme_response = 64 * 1024;
 constexpr std::uint64_t inline_body_limit = 16 * 1024;
 constexpr std::string_view allowed_methods = "GET, HEAD, OPTIONS";
 
@@ -662,13 +664,56 @@ auto log_request(const site& selected, const eventloop::http::request& request, 
     }
 }
 
+// Whether the request is an HTTP-01 challenge this site answers itself.
+[[nodiscard]] auto acme_challenge(const site& selected, const eventloop::http::request& request)
+    noexcept -> bool
+{
+    return selected.acme_webroot && request.path().starts_with(acme_prefix) &&
+        (request.method() == method_type::get || request.method() == method_type::head);
+}
+
+// RFC 8555 section 8.3: the key authorization a certbot --webroot run wrote
+// for the token, or 404. The token is base64url, so it names one file;
+// every component opens without following symbolic links, and the
+// challenge directory is found afresh since certbot may recreate it.
+[[nodiscard]] auto acme_reply(const site& selected, std::string_view path) -> reply
+{
+    reply answer;
+    answer.status = 404;
+    add_site_fields(answer, *selected.settings);
+    answer.add("cache-control", "no-store");
+    const auto token = path.substr(acme_prefix.size());
+    if (token.empty() || token.size() > 255 ||
+        token.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                                "0123456789-_") != std::string_view::npos)
+        return answer;
+    const auto well_known = open_child(selected.acme_webroot.get(), ".well-known", true);
+    const auto directory = well_known ? open_child(well_known.get(), "acme-challenge", true)
+                                      : unique_fd {};
+    const auto file = directory ? open_child(directory.get(), std::string(token), false)
+                                : unique_fd {};
+    file_info info;
+    if (!file || !stat_file(file.get(), info) || info.kind != file_info::type::regular ||
+        info.size > max_acme_response)
+        return answer;
+    auto data = read_whole(file.get(), info.size);
+    if (!data) return answer;
+    answer.status = 200;
+    answer.add("content-type", "text/plain");
+    answer.body = std::move(*data);
+    return answer;
+}
+
 auto respond(eventloop::event_loop& loop, eventloop::http::request& request,
              eventloop::http::response& response, bool health) -> eventloop::task<void>
 {
     const request_scope scope;
     const auto& context = *static_cast<const listener_context*>(request.route_context());
     const auto& selected = context.sites->select(request.authority());
-    if (selected.upstream && context.redirect_origin.empty()) {
+    // Challenges come first: Let's Encrypt asks on plain HTTP, and they must
+    // reach neither a redirect nor an upstream application.
+    const bool challenge = acme_challenge(selected, request);
+    if (selected.upstream && context.redirect_origin.empty() && !challenge) {
         const auto forwarded = co_await proxy_request(loop, request, response, selected,
                                                       context.secure);
         const auto outcome = forwarded ? *forwarded : proxy_outcome {500, std::nullopt};
@@ -677,7 +722,9 @@ auto respond(eventloop::event_loop& loop, eventloop::http::request& request,
     }
     reply answer;
     try {
-        if (!context.redirect_origin.empty()) {
+        if (challenge) {
+            answer = acme_reply(selected, request.path());
+        } else if (!context.redirect_origin.empty()) {
             answer.status = 308;
             const auto host = context.sites->named_host(request.authority());
             std::string location = host.empty() ? context.redirect_origin

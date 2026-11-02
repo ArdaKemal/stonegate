@@ -21,6 +21,8 @@ struct site {
     const server_config* settings {nullptr};
     // Open only for servers without an upstream.
     eventloop::unique_fd root;
+    // Open when acme_webroot is set.
+    eventloop::unique_fd acme_webroot;
     access_log* log {nullptr};
     std::optional<eventloop::ip_endpoint> upstream;
 };
