@@ -208,7 +208,8 @@ port = {port}
         assert '"GET /index.html?q=1 HTTP/1.1" 200 8 "http://ref/" "tester \\x22x\\x22" ' in first, first
         assert f'"127.0.0.1:{port}"' in first, first
         assert any('"GET /missing HTTP/1.1" 404 0' in line for line in lines), lines
-        assert any(line.startswith('- - - [') and '"HEAD /index.html HTTP/1.1" 200 0' in line
+        # Without the trusted field, the connection's address is logged.
+        assert any(line.startswith('127.0.0.1 - - [') and '"HEAD /index.html HTTP/1.1" 200 0' in line
                    for line in lines), lines
         # Rotation: move the file away, then SIGHUP reopens the path.
         rotated = log.with_suffix(".1")
@@ -481,6 +482,13 @@ max_request_body = 100000
 "x-frame-options" = "DENY"
 
 [[server]]
+name = "trusted"
+server_names = ["trusted.test"]
+real_ip_header = "x-forwarded-for"
+[server.proxy]
+upstream = "http://127.0.0.1:{upstream}"
+
+[[server]]
 name = "down"
 server_names = ["down.test"]
 [server.proxy]
@@ -501,9 +509,17 @@ root = "public"
         for line in ("host: app.test", "x-forwarded-proto: http", "x-forwarded-host: app.test",
                      "cookie: a=1", "x-custom: yes", "connection: close"):
             assert line in text.splitlines(), (line, text)
-        assert "x-forwarded-for" not in text and "x-drop" not in text, text
+        for line in ("x-forwarded-for: 127.0.0.1", "x-real-ip: 127.0.0.1"):
+            assert line in text.splitlines(), (line, text)
+        assert "198.51.100.1" not in text and "x-drop" not in text, text
         assert fields["x-frame-options"] == "DENY" and "x-hop" not in fields, fields
         assert fetch(port, "/", {"Host": "static.test"})[2] == b"website\n"
+        # Behind a trusted proxy, its client list is extended and the first
+        # entry becomes the real client.
+        text = fetch(port, "/echo", {"Host": "trusted.test", "X-Forwarded-For": "198.51.100.1",
+                                     "X-Real-IP": "203.0.113.9"})[2].decode()
+        for line in ("x-forwarded-for: 198.51.100.1, 127.0.0.1", "x-real-ip: 198.51.100.1"):
+            assert line in text.splitlines(), (line, text)
 
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         connection.request("POST", "/echo", body=b"x" * 50000, headers=app)
@@ -564,6 +580,7 @@ root = "public"
         resolve = f"app.test:{tls_port}:127.0.0.1"
         output = curl("--http2", "-k", "--resolve", resolve, f"https://app.test:{tls_port}/echo")
         assert b"x-forwarded-proto: https" in output and b"GET /echo" in output, output
+        assert b"x-forwarded-for: 127.0.0.1" in output, output
         uploaded = subprocess.run(
             [CURL, "-sS", "--noproxy", "*", "--http2", "-k", "--resolve", resolve, "-T", "-",
              f"https://app.test:{tls_port}/echo"],
@@ -587,6 +604,7 @@ root = "public"
         lines = wait_for_lines(work / "logs" / "proxy.log", 20)
         assert any('"GET /big HTTP/1.1" 200 2097152' in line for line in lines), lines
         assert any('"GET / HTTP/1.1" 502' in line for line in lines), lines
+        assert all(line.startswith(("127.0.0.1 ", "198.51.100.1 ")) for line in lines), lines
     backend.shutdown()
     check_config(work, '[defaults]\n[defaults.proxy]\nupstream = "http://example.com"\n',
                  "proxy upstream must be")
