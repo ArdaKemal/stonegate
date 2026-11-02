@@ -52,6 +52,9 @@ constexpr std::string_view usage =
     "  --gzip-max-size N       largest file to gzip (default 8388608)\n"
     "  --access-log FILE       append access log lines to FILE (- for stdout)\n"
     "  --real-ip-header NAME   log the first address of this request field\n"
+    "  --proxy-upstream URL    forward requests to http://ADDRESS[:PORT] instead of root\n"
+    "  --proxy-timeout-ms N    upstream connect/read/write timeout (1..3600000; default 60000)\n"
+    "  --proxy-max-request-body N  largest forwarded request body (default 1048576)\n"
     "  --reuse-port            allow multiple listeners to reuse a port\n"
     "  --no-reuse-port         disable port reuse\n"
     "  --shutdown-seconds N    in-flight request drain deadline (default 5)\n"
@@ -177,6 +180,45 @@ auto add_error_page(server_config& settings, std::string_view status_text, std::
     else settings.error_pages.emplace_back(status, path);
 }
 
+// "http://ADDRESS[:PORT][/]" with a numeric IPv4 address, a bracketed IPv6
+// address, or localhost (127.0.0.1). The port defaults to 80.
+auto set_upstream(server_config& settings, std::string_view value) -> void
+{
+    if (value.empty()) {
+        settings.upstream_address.clear();
+        settings.upstream_port = 0;
+        return;
+    }
+    const auto invalid = [] {
+        return std::invalid_argument("proxy upstream must be http://ADDRESS[:PORT] with a numeric "
+                                     "address or localhost");
+    };
+    constexpr std::string_view scheme = "http://";
+    if (!value.starts_with(scheme)) throw invalid();
+    auto rest = value.substr(scheme.size());
+    if (rest.ends_with('/')) rest.remove_suffix(1);
+    std::string_view address = rest, port;
+    if (rest.starts_with('[')) {
+        const auto close = rest.find(']');
+        if (close == std::string_view::npos) throw invalid();
+        address = rest.substr(1, close - 1);
+        rest.remove_prefix(close + 1);
+        if (!rest.empty() && !rest.starts_with(':')) throw invalid();
+        if (!rest.empty()) port = rest.substr(1);
+    } else if (const auto colon = rest.find(':'); colon != std::string_view::npos) {
+        address = rest.substr(0, colon);
+        port = rest.substr(colon + 1);
+    }
+    if (address == "localhost") address = "127.0.0.1";
+    if (address.contains('%')) throw invalid();
+    const auto number_port = port.empty() && !rest.ends_with(':')
+        ? std::uint16_t {80} : number<std::uint16_t>(port, "proxy upstream port", 1, 65535);
+    try { (void)eventloop::ip_endpoint::parse(address, number_port); }
+    catch (const std::invalid_argument&) { throw invalid(); }
+    settings.upstream_address = address;
+    settings.upstream_port = number_port;
+}
+
 auto apply(server_config& settings, std::string_view key, std::string_view value,
            const std::filesystem::path* config_dir = nullptr) -> void
 {
@@ -187,7 +229,8 @@ auto apply(server_config& settings, std::string_view key, std::string_view value
             ? (*config_dir / path).lexically_normal() : path).string();
     };
     if (value.empty() && key != "certificate" && key != "private-key" &&
-        key != "key-password" && key != "access-log" && key != "real-ip-header")
+        key != "key-password" && key != "access-log" && key != "real-ip-header" &&
+        key != "proxy-upstream")
         throw std::invalid_argument(std::string(key) + " has an empty value");
     if (key == "root") settings.root = path_value();
     else if (key == "bind") settings.bind = value;
@@ -231,6 +274,12 @@ auto apply(server_config& settings, std::string_view key, std::string_view value
         settings.gzip_min_size = number<std::uint64_t>(value, key, 0, std::uint64_t {1} << 30);
     else if (key == "gzip-max-size")
         settings.gzip_max_size = number<std::uint64_t>(value, key, 0, std::uint64_t {1} << 30);
+    else if (key == "proxy-upstream") set_upstream(settings, value);
+    else if (key == "proxy-timeout-ms")
+        settings.proxy_timeout_ms = number<int>(value, key, 1, 3600000);
+    else if (key == "proxy-max-request-body")
+        settings.proxy_max_request_body =
+            number<std::uint64_t>(value, key, 0, std::uint64_t {1} << 40);
     else throw std::invalid_argument("unknown setting");
 }
 
@@ -263,6 +312,9 @@ constexpr setting schema[] {
     {"compression", "gzip", "gzip", toml_type::boolean},
     {"compression", "gzip_min_size", "gzip-min-size", toml_type::integer},
     {"compression", "gzip_max_size", "gzip-max-size", toml_type::integer},
+    {"proxy", "upstream", "proxy-upstream", toml_type::string},
+    {"proxy", "timeout_ms", "proxy-timeout-ms", toml_type::integer},
+    {"proxy", "max_request_body", "proxy-max-request-body", toml_type::integer},
 };
 // Boolean settings that the CLI spells as --NAME and --no-NAME.
 constexpr std::string_view flag_settings[] {
@@ -307,7 +359,8 @@ auto read_server(server_config& settings, const toml_value& table,
     for (const auto& value : table) {
         const auto location = prefix + "." + std::string(value.key);
         if (section.empty() && (value.key == "http" || value.key == "tls" ||
-                                value.key == "http3" || value.key == "compression")) {
+                                value.key == "http3" || value.key == "compression" ||
+                                value.key == "proxy")) {
             read_server(settings, value, directory, location, value.key);
             continue;
         }
@@ -496,7 +549,8 @@ private:
 auto validate(const server_config& settings) -> void
 {
     std::error_code root_error;
-    if (settings.root.empty() || !std::filesystem::is_directory(settings.root, root_error))
+    if (settings.upstream_address.empty() &&
+        (settings.root.empty() || !std::filesystem::is_directory(settings.root, root_error)))
         throw std::invalid_argument("root must name an existing directory");
     const bool tls = !settings.certificate.empty() && !settings.private_key.empty();
     if (settings.certificate.empty() != settings.private_key.empty())

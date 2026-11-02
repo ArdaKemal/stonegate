@@ -6,6 +6,7 @@
 
 #include <fcntl.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -67,11 +68,18 @@ auto build_groups(const configuration& configuration, access_logs& logs)
         }
         site member;
         member.settings = &settings;
-        member.root = eventloop::unique_fd(::open(settings.root.c_str(),
-                                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        if (!member.root)
-            throw std::system_error(errno, std::generic_category(),
-                                    "server " + settings.name + ": open root");
+        if (!settings.upstream_address.empty()) {
+            member.upstream = eventloop::ip_endpoint::parse(settings.upstream_address,
+                                                            settings.upstream_port);
+            (*existing)->max_request_body =
+                std::max((*existing)->max_request_body, settings.proxy_max_request_body);
+        } else {
+            member.root = eventloop::unique_fd(::open(settings.root.c_str(),
+                                                      O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (!member.root)
+                throw std::system_error(errno, std::generic_category(),
+                                        "server " + settings.name + ": open root");
+        }
         if (!settings.access_log.empty()) member.log = logs.open(settings.access_log);
         (*existing)->sites.sites.push_back(std::move(member));
     }
@@ -83,6 +91,7 @@ auto build_groups(const configuration& configuration, access_logs& logs)
             ? 0 : static_cast<std::size_t>(fallback - sites.sites.begin());
         const auto& settings = configuration.servers[group->server];
         group->plain.sites = group->secure.sites = group->quic.sites = &sites;
+        group->secure.secure = group->quic.secure = true;
         if (settings.http3_port != 0)
             group->secure.alt_svc = "h3=\":" + std::to_string(settings.http3_port) + "\"; ma=86400";
         if (settings.mode == server_config::http_mode::redirect) {
@@ -140,6 +149,7 @@ auto worker_listeners::options(const listener_group& group, const generation& cu
         .header_timeout = std::chrono::milliseconds {settings.header_timeout_ms},
         .idle_timeout = std::chrono::milliseconds {settings.idle_timeout_ms},
         .enable_http2 = settings.http2,
+        .max_request_body = group.max_request_body,
         .connection_capacity = settings.http3_connections,
         .request_capacity = settings.http3_requests,
         .max_udp_payload_size = settings.http3_max_datagram,

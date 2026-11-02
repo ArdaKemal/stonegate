@@ -1,8 +1,9 @@
 # Stonegate
 
-A static file server for HTTP/1.1, TLS HTTP/1.1 and HTTP/2, and HTTP/3, built
-on the [eventloop](https://github.com/ArdaKemal/eventloop) C++23 coroutine
-library. It serves several sites by host name, writes access logs, compresses
+A static file server and reverse proxy for HTTP/1.1, TLS HTTP/1.1 and HTTP/2,
+and HTTP/3, built on the [eventloop](https://github.com/ArdaKemal/eventloop)
+C++23 coroutine library. It serves several sites by host name, forwards sites
+to local HTTP/1.1 applications, writes access logs, compresses
 text, applies cache and header policies, reloads certificates without a
 restart, drains requests on shutdown, and drops root after binding.
 
@@ -16,8 +17,11 @@ CMake finds eventloop in this order:
    Stonegate (without eventloop's examples and tests);
 2. an installed package exporting `eventloop::eventloop`, found through
    `CMAKE_PREFIX_PATH`;
-3. a download of `EVENTLOOP_GIT_TAG` (default `v0.1.0`, the release
+3. a download of `EVENTLOOP_GIT_TAG` (default `v0.2.0`, the release
    Stonegate is tested with) from `EVENTLOOP_GIT_REPOSITORY`.
+
+The reverse proxy needs eventloop 0.2 or newer (`tcp_stream_hold`); an
+installed package older than 0.2 is ignored.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -59,6 +63,11 @@ bound, and rule.
 - **Virtual hosts**: servers on the same ports are picked by `server_names`
   (exact names, then `*.domain` wildcards, then a default). One certificate
   per TLS listener; use a SAN or wildcard certificate across names.
+- **Reverse proxy**: a server with `[server.proxy] upstream =
+  "http://127.0.0.1:8096"` forwards every request to that HTTP/1.1
+  application, such as Jellyfin or Gitea, and streams the response back,
+  over every listener protocol. Bodies stream both ways; timeouts, request
+  body limits, and 502/504 answers are per server.
 - **Access logs**: Combined Log Format plus host and duration, per server or
   shared, written by a background thread with a bounded buffer.
   `real_ip_header` logs the client address from a trusted proxy's field.
@@ -99,7 +108,10 @@ Stonegate runs as, since reloads happen after the switch.
 - No SNI: one certificate per TLS listener, as eventloop's `https_server` and
   `http3_server` take one each.
 - The client address is not available from eventloop's request API; logs
-  show `-` unless `real_ip_header` is set behind a proxy.
+  show `-` unless `real_ip_header` is set behind a proxy, and proxied
+  applications see Stonegate's address instead of the client's.
+- The proxy opens one upstream connection per request, speaks plain HTTP/1.1
+  to numeric addresses only, and does not forward WebSocket upgrades.
 - A reload closes HTTP/3 connections (clients reconnect) and may reset a TCP
   connection still waiting in the old listener's backlog. Other settings
   need a restart.
@@ -107,7 +119,7 @@ Stonegate runs as, since reloads happen after the switch.
   oversized bodies, timeouts) get eventloop's empty error responses and are
   not logged.
 - HTTP/2 is TLS only. HTTP/3 has no dynamic QPACK, push, or WebTransport.
-  No uploads, proxying, CGI, or custom routes.
+  No CGI or custom routes.
 - The parsers are eventloop's; neither project is fuzzed yet. Put a proxy or
   CDN in front for hostile traffic until it is.
 
@@ -124,6 +136,7 @@ ranges, listings, traversal, and CLI/config equivalence (HTTP/2 and HTTP/3
 checks need a curl with them). `stonegate_configuration` covers the schema,
 includes, inheritance, timeouts, workers, and startup cleanup.
 `stonegate_features` covers access logs and their rotation, compression,
-virtual hosts, policies and error pages, certificate reload (including a
+virtual hosts, policies and error pages, the reverse proxy (framing, limits,
+upstream failures and resets, HTTP/2), certificate reload (including a
 failed one), draining shutdown, encrypted HTTP/3 keys, and account checks.
 They need Python 3, the OpenSSL CLI, and curl.

@@ -5,14 +5,15 @@ include(CTest)
 
 # eventloop comes from, in order: a source checkout (EVENTLOOP_SOURCE_DIR), an
 # installed package exporting eventloop::eventloop, or a download of
-# EVENTLOOP_GIT_TAG, the eventloop release Stonegate is tested with.
+# EVENTLOOP_GIT_TAG, the eventloop release Stonegate is tested with. The
+# reverse proxy needs eventloop 0.2 for tcp_stream_hold.
 set(EVENTLOOP_SOURCE_DIR "" CACHE PATH "eventloop source checkout to build with Stonegate")
 set(EVENTLOOP_GIT_REPOSITORY "https://github.com/ArdaKemal/eventloop.git" CACHE STRING
     "eventloop repository downloaded when no checkout or package is found")
-set(EVENTLOOP_GIT_TAG "v0.1.0" CACHE STRING "eventloop tag or commit to download")
+set(EVENTLOOP_GIT_TAG "v0.2.0" CACHE STRING "eventloop tag or commit to download")
 
 if(NOT EVENTLOOP_SOURCE_DIR)
-    find_package(eventloop CONFIG QUIET)
+    find_package(eventloop 0.2 CONFIG QUIET)
     if(NOT eventloop_FOUND)
         include(FetchContent)
         set(eventloop_download "${CMAKE_CURRENT_BINARY_DIR}/_deps")
@@ -47,6 +48,7 @@ add_executable(stonegate
     src/listeners.cc
     src/main.cc
     src/privileges.cc
+    src/proxy.cc
     src/static_files.cc
     src/toml.cc
     src/workers.cc)
