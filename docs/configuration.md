@@ -1,9 +1,10 @@
 # Stonegate configuration
 
 Stonegate reads TOML with its own [TOML 1.1 parser](toml.md). CLI-only
-invocations work without a file. A typical deployment is several static sites
-behind one set of ports, picked by host name, with common policy in
-`[defaults]` and sites split into included files.
+invocations work without a file. A typical deployment is several sites behind
+one set of ports, picked by host name, some static and some forwarded to
+local applications, with common policy in `[defaults]` and sites split into
+included files.
 
 ## Structure and inheritance
 
@@ -40,7 +41,7 @@ Fields below are allowed under both `defaults` and each `server`.
 
 | Field | Type | Default / bounds |
 | --- | --- | --- |
-| `root` | string path | Required existing directory |
+| `root` | string path | Existing directory; required unless `proxy.upstream` is set |
 | `bind` | string | `127.0.0.1`; numeric IPv4/IPv6, optional numeric IPv6 scope |
 | `server_names` | array of strings | Empty (any host); up to 16 lowercase names or `*.domain` |
 | `directory_listing` | boolean | `false` |
@@ -68,6 +69,9 @@ Fields below are allowed under both `defaults` and each `server`.
 | `headers` | table of strings | Up to 32 fields added to every response |
 | `cache_control` | table of strings | Up to 64 `"/prefix"` or `"*.ext"` rules |
 | `error_pages` | table of strings | Status (400, 403, 404, 405, 414, 500) to a root path |
+| `proxy.upstream` | string | Empty (serve files); `http://ADDRESS[:PORT]`, port 80 by default |
+| `proxy.timeout_ms` | integer | 60000; 1..3600000 |
+| `proxy.max_request_body` | integer | 1048576; 0..1 TiB bytes |
 
 `server.name` is a nonempty string, at most 64 ASCII letters, digits, `_`, `-`
 or `.`. `[runtime]` accepts `shutdown_seconds` (integer, default 5, 0..3600),
@@ -98,11 +102,65 @@ its one certificate, so it must cover every name (a SAN or wildcard
 certificate). Root, listing, compression, logging, and policy settings stay
 per server.
 
+## Reverse proxy
+
+A server with `proxy.upstream` forwards every request it is picked for,
+`/healthz` included, to that HTTP/1.1 address instead of serving files; its
+`root`, listing, compression, cache, and error-page settings are unused.
+`headers`, `access_log`, and `real_ip_header` still apply. The address is a
+numeric IPv4 address, a bracketed IPv6 address, or `localhost` (127.0.0.1),
+with an optional trailing `/`; there is no DNS lookup and no TLS to the
+upstream. An empty value clears an inherited upstream. A plain listener
+with `http.mode = "redirect"` still redirects instead of forwarding.
+
+```toml
+[[server]]
+name = "movies"
+server_names = ["movies.example.com"]
+[server.proxy]
+upstream = "http://127.0.0.1:8096"
+max_request_body = 104_857_600
+```
+
+Each request opens a new upstream connection and sends `connection: close`.
+The request keeps its method, path, query, `Host`, and fields, except
+connection-specific ones (`connection` and the fields it names, `keep-alive`,
+`proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
+`http2-settings`) and `expect`. Split HTTP/2 and HTTP/3 cookies are joined
+into one field. Stonegate sets `x-forwarded-proto` (`http`, or `https` on
+TLS and HTTP/3) and `x-forwarded-host`, replacing client values. Client
+`x-forwarded-for`, `forwarded`, and `x-real-ip` fields are removed unless
+`real_ip_header` is set, which marks Stonegate as running behind a trusted
+proxy. Stonegate does not know the client address, so it adds none.
+
+A body with a declared length is forwarded with that length; one without
+(HTTP/1.1 chunked, or HTTP/2 and HTTP/3 without `content-length`) is
+forwarded chunked. POST, PUT, and PATCH without a body send
+`content-length: 0`. A body above `proxy.max_request_body` answers 413
+before or while it is forwarded. The listeners accept bodies up to the
+largest limit among the servers sharing them, and at least 1 MiB.
+
+The upstream response may use `content-length`, chunked coding (extensions
+and trailers are dropped), or end at connection close; 1xx responses are
+skipped. Its status and fields reach the client, minus connection-specific
+fields, and a `content-length` is kept so clients see the size. A site
+`headers` field replaces an upstream field of the same name. The body
+streams through a 32 KiB buffer as it arrives.
+
+`proxy.timeout_ms` bounds connecting, each upstream read and write, and each
+request body read. An upstream that refuses the connection, closes early, or
+sends a malformed head answers 502; a connect or response-head timeout
+answers 504; a stalled or invalid request body answers 408 or 400. These
+local answers carry a short text body. A failure after the response has
+started abandons it: HTTP/1.1 closes the connection, and HTTP/2 and HTTP/3
+reset the stream. WebSocket and other upgrades are not forwarded. Writes to
+a slow client are not timed, as for files.
+
 ## Responses
 
-Stonegate answers every request itself: `GET /healthz` returns `ok`, `GET`
-and `HEAD` serve files, `OPTIONS` answers 204 with `Allow: GET, HEAD,
-OPTIONS`, and `POST`, `PUT`, `DELETE`, `PATCH`, and `TRACE` answer 405. With
+Static servers answer every request themselves: `GET /healthz` returns
+`ok`, `GET` and `HEAD` serve files, `OPTIONS` answers 204 with `Allow: GET,
+HEAD, OPTIONS`, and `POST`, `PUT`, `DELETE`, `PATCH`, and `TRACE` answer 405. With
 `http.mode = "redirect"` the plain listener answers every request with 308
 to `https://redirect_host[:tls.port]` plus the request path and query.
 

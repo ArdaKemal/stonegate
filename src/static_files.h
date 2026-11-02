@@ -9,10 +9,11 @@
 
 namespace stonegate {
 
-// A router that sends every request on one listener to Stonegate: GET
-// /healthz, static files for GET and HEAD, OPTIONS, and 405 for POST, PUT,
-// DELETE, PATCH, and TRACE. Each request is logged to its server's access
-// log. context must outlive every server using the router.
+// A router that sends every request on one listener to Stonegate: servers
+// with an upstream forward every method to it (see proxy.h); others answer
+// GET /healthz, static files for GET and HEAD, OPTIONS, and 405 for POST,
+// PUT, DELETE, PATCH, and TRACE. Each request is logged to its server's
+// access log. context must outlive every server using the router.
 [[nodiscard]] auto make_router(const listener_context& context)
     -> std::shared_ptr<const eventloop::http::router>;
 

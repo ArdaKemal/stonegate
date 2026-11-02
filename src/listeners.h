@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <vector>
@@ -27,6 +28,8 @@ struct listener_group {
     // Configuration index of the first server, whose listener settings and
     // credentials the group uses.
     std::size_t server {0};
+    // The largest request body any of the servers accepts.
+    std::uint64_t max_request_body {std::uint64_t {1} << 20};
     site_group sites;
     listener_context plain, secure, quic;
     std::shared_ptr<const eventloop::http::router> plain_routes, secure_routes, quic_routes;

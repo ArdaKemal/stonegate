@@ -74,6 +74,15 @@ struct server_config {
     std::vector<cache_rule> cache_rules;
     // Status code and a document-root path served as that error's body.
     std::vector<std::pair<unsigned, std::string>> error_pages;
+    // Reverse proxy: a numeric HTTP/1.1 upstream that receives every request
+    // instead of the document root. An empty address serves files.
+    std::string upstream_address;
+    std::uint16_t upstream_port = 0;
+    // Bounds connecting, each upstream read and write, and each request body
+    // read while forwarding.
+    int proxy_timeout_ms = 60000;
+    // The largest request body forwarded; larger ones answer 413.
+    std::uint64_t proxy_max_request_body = std::uint64_t {1} << 20;
 };
 
 // How several workers receive connections: each opens every listener with

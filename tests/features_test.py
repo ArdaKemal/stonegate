@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Exercise access logs, compression, virtual hosts, response policies,
-certificate reload, draining shutdown, encrypted HTTP/3 keys, and account
+the reverse proxy, certificate reload, draining shutdown, encrypted HTTP/3 keys, and account
 switching through the Stonegate executable."""
 import contextlib
 import getpass
 import gzip
 import http.client
+import http.server
 import os
 import pathlib
 import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SERVER = str(pathlib.Path(sys.argv[1]).resolve())
@@ -351,6 +354,248 @@ root = "fallback"
     print("Host-based virtual hosts, cache rules, headers, and error pages: PASS")
 
 
+class Upstream(http.server.BaseHTTPRequestHandler):
+    """A backend for the proxy tests; the path picks the response."""
+
+    protocol_version = "HTTP/1.1"
+    big = bytes(range(256)) * 8192  # 2 MiB
+
+    def log_message(self, *arguments):
+        pass
+
+    def body(self):
+        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+            data = b""
+            while True:
+                size = int(self.rfile.readline().split(b";")[0], 16)
+                if size == 0:
+                    while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                        pass
+                    return data
+                data += self.rfile.read(size)
+                self.rfile.readline()
+        return self.rfile.read(int(self.headers.get("content-length", 0)))
+
+    def answer(self, status, body, fields=()):
+        self.send_response(status)
+        for name, value in fields:
+            self.send_header(name, value)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ConnectionError, ValueError):
+            self.close_connection = True
+
+    def dispatch(self):
+        path = self.path.split("?")[0]
+        if path == "/slow":
+            time.sleep(float(self.path.split("=")[1]))
+        if path in ("/echo", "/slow", "/healthz"):
+            received = self.body()
+            lines = [f"{self.command} {self.path}"]
+            lines += [f"{name.lower()}: {value}" for name, value in self.headers.items()]
+            lines += ["", received.decode("latin-1")]
+            self.answer(200, "\n".join(lines).encode("latin-1"),
+                        [("content-type", "text/plain"), ("x-frame-options", "SAMEORIGIN"),
+                         ("connection", "close, x-hop"), ("x-hop", "1")])
+        elif path == "/big":
+            self.answer(200, self.big, [("content-type", "application/octet-stream")])
+        elif path == "/chunked":
+            self.send_response(200)
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            for part in (b"alpha ", b"beta " * 5000, b"gamma\n"):
+                self.wfile.write(b"%x;ext=1\r\n%s\r\n" % (len(part), part))
+            self.wfile.write(b"0\r\nx-trailer: 1\r\n\r\n")
+        elif path == "/until-close":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nuntil close\n")
+            self.close_connection = True
+        elif path == "/interim":
+            self.wfile.write(b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>\r\n\r\n")
+            self.answer(201, b"created\n")
+        elif path == "/empty":
+            self.send_response(204)
+            self.end_headers()
+        elif path == "/reset":
+            self.send_response(200)
+            self.send_header("content-length", str(len(self.big)))
+            self.end_headers()
+            self.wfile.write(self.big[:65536])
+            self.wfile.flush()
+            time.sleep(0.3)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                       struct.pack("ii", 1, 0))
+            self.connection.close()
+            self.close_connection = True
+        elif path == "/garbage":
+            self.wfile.write(b"NOT HTTP\r\n\r\n")
+            self.close_connection = True
+        else:
+            self.answer(404, b"upstream missing\n")
+
+    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = dispatch
+
+
+class Backend(http.server.ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+
+
+def curl(*arguments):
+    result = subprocess.run([CURL, "-sS", "--noproxy", "*", *arguments], capture_output=True,
+                            timeout=10)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_reverse_proxy(work):
+    port, tls_port, unused = free_ports(3)
+    backend = Backend(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    upstream = backend.server_address[1]
+    cert, key = make_certificate(work, "proxy")
+    (work / "logs").mkdir(exist_ok=True)
+    config = work / "proxy.toml"
+    config.write_text(f'''[defaults]
+access_log = "logs/proxy.log"
+[defaults.http]
+port = {port}
+[defaults.tls]
+port = {tls_port}
+certificate = "{cert}"
+private_key = "{key}"
+
+[[server]]
+name = "app"
+server_names = ["app.test"]
+[server.proxy]
+upstream = "http://localhost:{upstream}/"
+timeout_ms = 1000
+max_request_body = 100000
+[server.headers]
+"x-frame-options" = "DENY"
+
+[[server]]
+name = "down"
+server_names = ["down.test"]
+[server.proxy]
+upstream = "http://127.0.0.1:{unused}"
+
+[[server]]
+name = "static"
+root = "public"
+''')
+    app = {"Host": "app.test"}
+    with running(work, config) as server:
+        server.ready(port)
+        status, fields, body = fetch(port, "/echo?q=1", {
+            **app, "X-Forwarded-For": "198.51.100.1", "Cookie": "a=1", "X-Custom": "yes",
+            "Connection": "x-drop", "X-Drop": "1"})
+        text = body.decode()
+        assert status == 200 and text.startswith("GET /echo?q=1\n"), text
+        for line in ("host: app.test", "x-forwarded-proto: http", "x-forwarded-host: app.test",
+                     "cookie: a=1", "x-custom: yes", "connection: close"):
+            assert line in text.splitlines(), (line, text)
+        assert "x-forwarded-for" not in text and "x-drop" not in text, text
+        assert fields["x-frame-options"] == "DENY" and "x-hop" not in fields, fields
+        assert fetch(port, "/", {"Host": "static.test"})[2] == b"website\n"
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("POST", "/echo", body=b"x" * 50000, headers=app)
+        response = connection.getresponse()
+        text = response.read().decode()
+        assert response.status == 200 and "content-length: 50000" in text, text[:300]
+        assert text.endswith("\n" + "x" * 50000), text[-100:]
+        connection.request("PUT", "/echo", body=iter([b"one ", b"two"]), headers=app,
+                           encode_chunked=True)
+        response = connection.getresponse()
+        text = response.read().decode()
+        assert "transfer-encoding: chunked" in text and text.endswith("\none two"), text
+        connection.close()
+
+        status, fields, body = fetch(port, "/echo", app, method="HEAD")
+        assert status == 200 and body == b"" and int(fields["content-length"]) > 0, fields
+        status, fields, body = fetch(port, "/big", app)
+        assert status == 200 and body == Upstream.big, (status, len(body))
+        assert fields["content-length"] == str(len(Upstream.big)), fields
+        status, fields, body = fetch(port, "/chunked", app)
+        assert body == b"alpha " + b"beta " * 5000 + b"gamma\n", body[:40]
+        assert "x-trailer" not in fields, fields
+        assert fetch(port, "/until-close", app)[2] == b"until close\n"
+        assert fetch(port, "/interim", app)[:3:2] == (201, b"created\n")
+        assert fetch(port, "/empty", app)[0] == 204
+        assert fetch(port, "/nothing", app)[:3:2] == (404, b"upstream missing\n")
+
+        status, _, body = fetch(port, "/echo", app, method="POST")
+        assert status == 200 and "content-length: 0" in body.decode(), body
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("POST", "/echo", body=b"x" * 100001, headers=app)
+        assert connection.getresponse().status == 413
+        connection.close()
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("POST", "/echo", body=iter([b"x" * 60000] * 2), headers=app,
+                           encode_chunked=True)
+        assert connection.getresponse().status == 413
+        connection.close()
+
+        assert fetch(port, "/", {"Host": "down.test"})[0] == 502
+        assert fetch(port, "/garbage", app)[0] == 502
+        status, _, body = fetch(port, "/slow?s=2", app)
+        assert status == 504 and body == b"504 gateway timeout\n", (status, body)
+
+        # The upstream resets mid-body while Stonegate writes to the client.
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/reset", headers=app)
+        response = connection.getresponse()
+        try:
+            data = response.read()
+            assert len(data) < len(Upstream.big), len(data)
+        except (http.client.IncompleteRead, ConnectionError):
+            pass
+        connection.close()
+        assert fetch(port, "/echo", app)[0] == 200
+
+        # HTTP/2 over TLS, including a request body without a length.
+        resolve = f"app.test:{tls_port}:127.0.0.1"
+        output = curl("--http2", "-k", "--resolve", resolve, f"https://app.test:{tls_port}/echo")
+        assert b"x-forwarded-proto: https" in output and b"GET /echo" in output, output
+        uploaded = subprocess.run(
+            [CURL, "-sS", "--noproxy", "*", "--http2", "-k", "--resolve", resolve, "-T", "-",
+             f"https://app.test:{tls_port}/echo"],
+            input=b"streamed body", capture_output=True, timeout=10)
+        assert uploaded.stdout.endswith(b"\nstreamed body"), uploaded
+        assert b"transfer-encoding: chunked" in uploaded.stdout, uploaded.stdout
+        output = curl("--http2", "-k", "--resolve", resolve, f"https://app.test:{tls_port}/big")
+        assert output == Upstream.big, len(output)
+
+        # Requests in flight at once each hold a proxy exchange.
+        results = []
+        def slow():
+            results.append(fetch(port, "/slow?s=0.3", app)[0])
+        workers = [threading.Thread(target=slow) for _ in range(64)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        assert results == [200] * 64, results
+
+        lines = wait_for_lines(work / "logs" / "proxy.log", 20)
+        assert any('"GET /big HTTP/1.1" 200 2097152' in line for line in lines), lines
+        assert any('"GET / HTTP/1.1" 502' in line for line in lines), lines
+    backend.shutdown()
+    check_config(work, '[defaults]\n[defaults.proxy]\nupstream = "http://example.com"\n',
+                 "proxy upstream must be")
+    check_config(work, '[defaults]\n[defaults.proxy]\nupstream = "http://[::1]:8000"\n')
+    check_config(work, '[defaults]\n[defaults.proxy]\nupstream = "http://127.0.0.1:0"\n',
+                 "proxy upstream port")
+    print("Reverse proxy forwarding, framing, limits, failures, and HTTP/2: PASS")
+
+
 def test_certificate_reload(work):
     tls_port, h3_port = free_ports(2)
     cert, key = work / "live-cert.pem", work / "live-key.pem"
@@ -526,6 +771,7 @@ def main(work):
     test_access_log(work)
     test_compression(work)
     test_virtual_hosts_and_policies(work)
+    test_reverse_proxy(work)
     test_certificate_reload(work)
     test_draining_shutdown(work)
     test_encrypted_http3_key(work)

@@ -78,3 +78,13 @@ root = "public"
 # root = "downloads"
 # server_names = ["downloads.example.com"]
 # directory_listing = true
+
+# A site forwarded to a local HTTP/1.1 application, such as Jellyfin or
+# Gitea. It needs no root; headers and access logs still apply:
+# [[server]]
+# name = "movies"
+# server_names = ["movies.example.com"]
+# [server.proxy]
+# upstream = "http://127.0.0.1:8096"
+# timeout_ms = 60_000             # connect, upstream reads/writes, body reads
+# max_request_body = 104_857_600  # larger uploads answer 413

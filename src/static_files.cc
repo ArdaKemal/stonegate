@@ -2,6 +2,8 @@
 
 #include "access_log.h"
 #include "file_response.h"
+#include "proxy.h"
+#include "text.h"
 
 #include "eventloop/http/mime_types.h"
 
@@ -68,24 +70,6 @@ struct reply {
 
     auto add(std::string_view name, std::string_view value) -> void { fields.emplace_back(name, value); }
 };
-
-[[nodiscard]] constexpr auto lower(char value) noexcept -> char
-{
-    return value >= 'A' && value <= 'Z' ? static_cast<char>(value - 'A' + 'a') : value;
-}
-
-[[nodiscard]] auto equal_lowercase(std::string_view text, std::string_view lowercase) noexcept -> bool
-{
-    return text.size() == lowercase.size() &&
-        std::ranges::equal(text, lowercase, [](char left, char right) { return lower(left) == right; });
-}
-
-[[nodiscard]] auto trim(std::string_view text) noexcept -> std::string_view
-{
-    const auto first = text.find_first_not_of(" \t");
-    if (first == std::string_view::npos) return {};
-    return text.substr(first, text.find_last_not_of(" \t") - first + 1);
-}
 
 // Every value of a repeated field, joined by commas.
 [[nodiscard]] auto joined_field(const eventloop::http::request& request, std::string_view name)
@@ -689,6 +673,13 @@ auto respond(eventloop::event_loop& loop, eventloop::http::request& request,
     const request_scope scope;
     const auto& context = *static_cast<const listener_context*>(request.route_context());
     const auto& selected = context.sites->select(request.authority());
+    if (selected.upstream && context.redirect_origin.empty()) {
+        const auto forwarded = co_await proxy_request(loop, request, response, selected,
+                                                      context.secure);
+        const auto outcome = forwarded ? *forwarded : proxy_outcome {500, std::nullopt};
+        log_request(selected, request, outcome.status, outcome.bytes, scope.start);
+        co_return;
+    }
     reply answer;
     try {
         if (!context.redirect_origin.empty()) {
