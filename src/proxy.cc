@@ -6,6 +6,8 @@
 #include "eventloop/tcp_stream.h"
 
 #include <arpa/inet.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -44,7 +46,8 @@ constexpr std::size_t max_chunk_line = 4096;
 // Request fields the proxy sets itself or that apply to one connection only.
 constexpr std::string_view dropped_request_fields[] {
     "connection", "content-length", "expect", "host", "http2-settings", "keep-alive",
-    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-for",
+    "proxy-connection", "sec-websocket-extensions", "sec-websocket-key",
+    "sec-websocket-version", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-for",
     "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
 };
 constexpr std::string_view dropped_response_fields[] {
@@ -116,6 +119,48 @@ template<typename T>
     return text.data();
 }
 
+[[nodiscard]] auto base64(std::span<const unsigned char> data) -> std::string
+{
+    std::string text(4 * ((data.size() + 2) / 3), '\0');
+    const int size = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(text.data()), data.data(),
+                                     static_cast<int>(data.size()));
+    text.resize(size < 0 ? 0 : static_cast<std::size_t>(size));
+    return text;
+}
+
+// A fresh Sec-WebSocket-Key: sixteen random bytes in base64. Empty on failure.
+[[nodiscard]] auto websocket_key() -> std::string
+{
+    std::array<unsigned char, 16> nonce {};
+    if (RAND_bytes(nonce.data(), static_cast<int>(nonce.size())) != 1) return {};
+    return base64(nonce);
+}
+
+// RFC 6455 section 4.2.2: the Sec-WebSocket-Accept value for a key.
+[[nodiscard]] auto websocket_accept(std::string_view key) -> std::string
+{
+    const auto input = std::string(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+    unsigned int size = 0;
+    if (EVP_Digest(input.data(), input.size(), digest.data(), &size, EVP_sha1(), nullptr) != 1)
+        return {};
+    return base64(std::span(digest).first(size));
+}
+
+// An HTTP/1.1 Upgrade to WebSocket, or HTTP/2 and HTTP/3 Extended CONNECT.
+[[nodiscard]] auto is_websocket(const eventloop::http::request& request) noexcept -> bool
+{
+    if (request.protocol() != eventloop::http::protocol::http1_1)
+        return request.method() == method_type::connect &&
+            request.connect_protocol() == "websocket";
+    bool upgrade = false, connection = false;
+    for (const auto& field : request.headers()) {
+        if (equal_lowercase(field.name, "upgrade")) upgrade |= lists(field.value, "websocket");
+        if (equal_lowercase(field.name, "connection")) connection |= lists(field.value, "upgrade");
+    }
+    return request.method() == method_type::get && upgrade && connection;
+}
+
 // The upstream stream, closed when the exchange ends. The hold keeps it valid
 // when the upstream resets while the proxy waits on the client.
 class upstream_connection {
@@ -173,6 +218,10 @@ struct exchange {
     std::vector<std::pair<std::string, std::string>> fields;
     std::vector<header> views;
     std::uint64_t sent {0};
+    // The key sent upstream for a WebSocket request, else empty.
+    std::string websocket_key;
+    // A 101 response that completes the WebSocket handshake.
+    bool upgraded {false};
 
     [[nodiscard]] auto buffered() const noexcept -> std::string_view
     {
@@ -265,7 +314,9 @@ auto build_head(exchange& state, bool secure, std::optional<std::uint64_t> lengt
     std::string forwarded_for;
     auto& head = state.head;
     head.reserve(1024);
-    head.append(request.method_name()).append(" ").append(request.path());
+    // HTTP/2 and HTTP/3 WebSockets arrive as CONNECT; HTTP/1.1 opens them with GET.
+    const bool websocket = !state.websocket_key.empty();
+    head.append(websocket ? "GET" : request.method_name()).append(" ").append(request.path());
     if (!request.query().empty()) head.append("?").append(request.query());
     head.append(" HTTP/1.1\r\nhost: ");
     const auto authority = request.authority();
@@ -306,6 +357,11 @@ auto build_head(exchange& state, bool secure, std::optional<std::uint64_t> lengt
         head.append("x-real-ip: ").append(client).append("\r\n");
     if (!authority.empty() && is_field_value(authority))
         head.append("x-forwarded-host: ").append(authority).append("\r\n");
+    if (websocket) {
+        head.append("sec-websocket-version: 13\r\nsec-websocket-key: ").append(state.websocket_key)
+            .append("\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n");
+        return;
+    }
     if (length) head.append("content-length: ").append(std::to_string(*length)).append("\r\n");
     else if (chunked) head.append("transfer-encoding: chunked\r\n");
     else if (request.method() == method_type::post || request.method() == method_type::put ||
@@ -384,7 +440,7 @@ auto fill(eventloop::event_loop& loop, exchange& state) -> eventloop::task<io_re
 }
 
 // Parses one response head, without its blank line. Returns false when it is
-// malformed. A 1xx head sets status and nothing else.
+// malformed. A 1xx head other than 101 sets status and nothing else.
 [[nodiscard]] auto parse_head(exchange& state, std::string_view head) -> bool
 {
     const auto line_end = head.find('\n');
@@ -398,11 +454,12 @@ auto fill(eventloop::event_loop& loop, exchange& state) -> eventloop::task<io_re
     const auto [end, error] = std::from_chars(digits.data(), digits.data() + 3, status);
     if (error != std::errc {} || end != digits.data() + 3 || status < 100) return false;
     state.status = status;
-    if (status < 200) return true;
+    if (status < 200 && status != 101) return true;
     state.fields.clear();
     std::optional<std::uint64_t> length;
     bool chunked = false, encoded = false;
     std::string_view connection;
+    bool upgrade = false, accepted = false;
     auto rest = line_end == std::string_view::npos ? std::string_view {}
                                                    : head.substr(line_end + 1);
     while (!rest.empty()) {
@@ -429,11 +486,16 @@ auto fill(eventloop::event_loop& loop, exchange& state) -> eventloop::task<io_re
             chunked = equal_lowercase(coding, "chunked");
         } else if (name == "connection") {
             connection = value;
+        } else if (name == "upgrade") {
+            upgrade = lists(value, "websocket");
+        } else if (name == "sec-websocket-accept") {
+            accepted = !state.websocket_key.empty() && value == websocket_accept(state.websocket_key);
         }
         state.fields.emplace_back(std::move(name), value);
     }
-    const bool bodyless = state.request.method() == method_type::head || status == 204 ||
-        status == 304;
+    state.upgraded = status == 101 && upgrade && accepted;
+    const bool bodyless = state.request.method() == method_type::head || status == 101 ||
+        status == 204 || status == 304;
     if (bodyless) state.body = framing::none;
     else if (encoded) state.body = chunked ? framing::chunked : framing::until_close;
     else if (length) state.body = framing::length;
@@ -474,7 +536,12 @@ auto receive_head(eventloop::event_loop& loop, exchange& state) -> eventloop::ta
         }
         if (!parse_head(state, buffered.substr(0, boundary))) co_return std::unexpected(502u);
         state.start += boundary + separator;
-        if (state.status == 101 || state.status > 599) co_return std::unexpected(502u);
+        // 101 completes only the WebSocket handshake this proxy asked for.
+        if (state.status == 101) {
+            if (!state.upgraded) co_return std::unexpected(502u);
+            co_return step_result {};
+        }
+        if (state.status > 599) co_return std::unexpected(502u);
         if (state.status >= 200) co_return step_result {};
     }
 }
@@ -571,6 +638,57 @@ auto relay_body(eventloop::event_loop& loop, exchange& state) -> eventloop::task
     }
 }
 
+// Relays client WebSocket bytes upstream until either side stops.
+auto client_to_upstream(eventloop::event_loop& loop, exchange& state,
+                        eventloop::http::websocket_stream& socket) -> eventloop::task<void>
+{
+    for (;;) {
+        const auto read = flatten_result(co_await socket.async_read_some(state.output));
+        if (!read || *read == 0) co_return;
+        const auto sent = flatten_result(co_await bounded(loop, write_all(loop, *state.stream,
+            std::span(state.output).first(*read)), state.timeout));
+        if (!sent) co_return;
+    }
+}
+
+// Relays upstream bytes, starting with any after the 101 head, to the client.
+auto upstream_to_client(eventloop::event_loop& loop, exchange& state,
+                        eventloop::http::websocket_stream& socket) -> eventloop::task<void>
+{
+    (void)loop;
+    for (;;) {
+        if (state.start != state.end) {
+            const auto written = flatten_result(co_await socket.async_write_some(
+                std::span(state.input).subspan(state.start, state.end - state.start)));
+            if (!written || *written == 0) co_return;
+            state.start += *written;
+            state.sent += *written;
+            continue;
+        }
+        state.start = state.end = 0;
+        const auto read = co_await state.stream->async_read_some(state.input);
+        if (!read || *read == 0) co_return;
+        state.end = *read;
+    }
+}
+
+// Accepts the client's WebSocket with the upstream's subprotocol, then relays
+// bytes both ways without a timeout until either side closes; the other
+// direction is then cancelled. WebSocket frames pass unchanged.
+auto tunnel(eventloop::event_loop& loop, exchange& state) -> eventloop::task<step<proxy_outcome>>
+{
+    std::string_view selected;
+    for (const auto& [name, value] : state.fields)
+        if (name == "sec-websocket-protocol") selected = value;
+    auto accepted = co_await state.request.async_accept_websocket(selected);
+    if (!accepted) co_return std::unexpected(500u);
+    if (!*accepted) co_return std::unexpected(400u);
+    auto& socket = **accepted;
+    (void)co_await eventloop::race(client_to_upstream(loop, state, socket),
+                                   upstream_to_client(loop, state, socket));
+    co_return proxy_outcome {101, state.sent};
+}
+
 // A short local response, for failures before the upstream answers.
 auto reply_status(eventloop::event_loop& loop, exchange& state, unsigned status)
     -> eventloop::task<proxy_outcome>
@@ -599,9 +717,14 @@ auto forward(eventloop::event_loop& loop, exchange& state, bool secure)
     const auto length = state.request.content_length();
     if (length && *length > state.target.settings->proxy_max_request_body)
         co_return std::unexpected(413u);
+    if (is_websocket(state.request)) {
+        state.websocket_key = websocket_key();
+        if (state.websocket_key.empty()) co_return std::unexpected(500u);
+    }
     // Without a declared length, a first chunk tells whether a body follows.
+    // A WebSocket request has no body to read before acceptance.
     std::size_t first = 0;
-    if (!length) {
+    if (!length && state.websocket_key.empty()) {
         const auto read = settle(co_await read_client(loop, state, body_chunk));
         if (!read) co_return std::unexpected(read.error());
         first = *read;
@@ -620,6 +743,7 @@ auto forward(eventloop::event_loop& loop, exchange& state, bool secure)
         co_return std::unexpected(sent.error());
     if (const auto received = settle(co_await receive_head(loop, state)); !received)
         co_return std::unexpected(received.error());
+    if (state.status == 101) co_return settle(co_await tunnel(loop, state));
     state.views.clear();
     for (const auto& [name, value] : state.fields) state.views.push_back({name, value});
     const auto failed = proxy_outcome {state.status, std::nullopt};

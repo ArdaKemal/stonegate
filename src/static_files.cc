@@ -778,9 +778,10 @@ auto make_router(const listener_context& context) -> std::shared_ptr<const event
         if (!result) throw std::runtime_error("register " + std::string(what));
     };
     add(routes->add(method_type::get, "/healthz", healthz, data), "/healthz");
+    // CONNECT carries HTTP/2 and HTTP/3 WebSockets for proxied servers.
     for (const auto method : {method_type::get, method_type::options, method_type::post,
                               method_type::put, method_type::delete_, method_type::patch,
-                              method_type::trace})
+                              method_type::trace, method_type::connect})
         add(routes->add_prefix(method, "/", serve, data), "static route");
     return routes;
 }

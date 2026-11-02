@@ -67,8 +67,9 @@ bound, and rule.
 - **Reverse proxy**: a server with `[server.proxy] upstream =
   "http://127.0.0.1:8096"` forwards every request to that HTTP/1.1
   application, such as Jellyfin or Gitea, and streams the response back,
-  over every listener protocol. Bodies stream both ways; timeouts, request
-  body limits, and 502/504 answers are per server.
+  over every listener protocol. Bodies stream both ways; WebSockets pass
+  through from HTTP/1.1 Upgrade, HTTP/2, or HTTP/3 clients; timeouts,
+  request body limits, and 502/504 answers are per server.
 - **Access logs**: Combined Log Format plus host and duration, per server or
   shared, written by a background thread with a bounded buffer.
   Clients are logged by address, or by a trusted proxy's field with
@@ -111,8 +112,9 @@ Stonegate runs as, since reloads happen after the switch.
   `http3_server` take one each.
 - Proxied applications receive the client address in `X-Forwarded-For` and
   `X-Real-IP`; they must trust Stonegate's address as a proxy to use it.
-- The proxy opens one upstream connection per request, speaks plain HTTP/1.1
-  to numeric addresses only, and does not forward WebSocket upgrades.
+- The proxy opens one upstream connection per request and speaks plain
+  HTTP/1.1 to numeric addresses only. WebSocket extensions such as
+  permessage-deflate are not negotiated through it.
 - A reload closes HTTP/3 connections (clients reconnect) and may reset a TCP
   connection still waiting in the old listener's backlog. Other settings
   need a restart.

@@ -2,9 +2,11 @@
 """Exercise access logs, compression, virtual hosts, response policies,
 the reverse proxy, certificate reload, draining shutdown, encrypted HTTP/3 keys, and account
 switching through the Stonegate executable."""
+import base64
 import contextlib
 import getpass
 import gzip
+import hashlib
 import http.client
 import http.server
 import os
@@ -22,6 +24,13 @@ import time
 
 SERVER = str(pathlib.Path(sys.argv[1]).resolve())
 CURL = shutil.which("curl")
+try:
+    import h2.config
+    import h2.connection
+    import h2.events
+    import h2.settings
+except ImportError:
+    h2 = None
 CURL_H3 = bool(CURL) and "HTTP3" in subprocess.run(
     [CURL, "--version"], capture_output=True, text=True, check=True).stdout
 
@@ -433,13 +442,206 @@ class Upstream(http.server.BaseHTTPRequestHandler):
                                        struct.pack("ii", 1, 0))
             self.connection.close()
             self.close_connection = True
+        elif path in ("/ws", "/ws-bad") and self.headers.get("upgrade", "").lower() == "websocket":
+            self.websocket(path == "/ws-bad")
+        elif path == "/ws-deny":
+            self.answer(403, b"denied\n")
         elif path == "/garbage":
             self.wfile.write(b"NOT HTTP\r\n\r\n")
             self.close_connection = True
         else:
             self.answer(404, b"upstream missing\n")
 
+    def websocket(self, bad_accept):
+        """Echoes text frames with an "echo:" prefix after a greeting that
+        reports what the proxy sent, then answers Close with Close."""
+        key = self.headers["sec-websocket-key"]
+        accept = "bad" if bad_accept else websocket_accept(key)
+        offered = [item.strip() for item in self.headers.get("sec-websocket-protocol", "").split(",")]
+        head = ("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n")
+        if "chat" in offered:
+            head += "Sec-WebSocket-Protocol: chat\r\n"
+        seen = " ".join(self.headers.get(name, "-") for name in (
+            "x-real-ip", "x-forwarded-proto", "origin", "sec-websocket-extensions"))
+        # The greeting shares a write with the head, so it arrives behind it.
+        self.wfile.write(head.encode() + b"\r\n" + ws_frame(1, f"hello {seen}".encode()))
+        self.close_connection = True
+        while True:
+            opcode, payload = ws_read(self.rfile.read)
+            if opcode == 8:
+                self.wfile.write(ws_frame(8, payload))
+                return
+            self.wfile.write(ws_frame(1, b"echo:" + payload))
+
     do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = dispatch
+
+
+def websocket_accept(key):
+    digest = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+    return base64.b64encode(digest).decode()
+
+
+def ws_frame(opcode, payload, mask=False):
+    """One final frame; clients mask, servers do not."""
+    size = len(payload)
+    bit = 0x80 if mask else 0
+    head = bytes([0x80 | opcode])
+    if size < 126:
+        head += bytes([bit | size])
+    elif size < 65536:
+        head += bytes([bit | 126]) + struct.pack(">H", size)
+    else:
+        head += bytes([bit | 127]) + struct.pack(">Q", size)
+    if mask:
+        key = os.urandom(4)
+        head += key
+        payload = bytes(byte ^ key[index % 4] for index, byte in enumerate(payload))
+    return head + payload
+
+
+def ws_read(read):
+    """Reads one frame through read(count); returns (opcode, payload)."""
+    first, second = read(2)
+    size = second & 0x7F
+    if size == 126:
+        size, = struct.unpack(">H", read(2))
+    elif size == 127:
+        size, = struct.unpack(">Q", read(8))
+    key = read(4) if second & 0x80 else None
+    payload = read(size) if size else b""
+    if key:
+        payload = bytes(byte ^ key[index % 4] for index, byte in enumerate(payload))
+    return first & 0x0F, payload
+
+
+def exact_reader(sock):
+    pending = bytearray()
+
+    def read(count):
+        while len(pending) < count:
+            data = sock.recv(65536)
+            if not data:
+                raise ConnectionError("closed")
+            pending.extend(data)
+        result = bytes(pending[:count])
+        del pending[:count]
+        return result
+
+    def head():
+        while b"\r\n\r\n" not in pending:
+            data = sock.recv(65536)
+            if not data:
+                raise ConnectionError("closed")
+            pending.extend(data)
+        end = pending.index(b"\r\n\r\n") + 4
+        text = bytes(pending[:end]).decode()
+        del pending[:end]
+        return text
+
+    return read, head
+
+
+def websocket_h1(port, host, path="/ws", tls=False):
+    """Runs an HTTP/1.1 WebSocket exchange; returns (head, frames seen)."""
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock = ssl._create_unverified_context().wrap_socket(raw, server_hostname=host) if tls else raw
+    with sock:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                      "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                      f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Protocol: other, chat\r\n"
+                      "Sec-WebSocket-Extensions: permessage-deflate\r\n"
+                      "Origin: https://app.test\r\n\r\n").encode() +
+                     ws_frame(1, b"first", mask=True))
+        read, head = exact_reader(sock)
+        response = head()
+        if not response.startswith("HTTP/1.1 101 "):
+            return response, []
+        assert f"sec-websocket-accept: {websocket_accept(key)}\r\n" in response, response
+        frames = [ws_read(read), ws_read(read)]
+        large = bytes(range(256)) * 400
+        sock.sendall(ws_frame(2, large, mask=True))
+        frames.append(ws_read(read))
+        assert frames[-1] == (1, b"echo:" + large), len(frames[-1][1])
+        sock.sendall(ws_frame(8, struct.pack(">H", 1000), mask=True))
+        frames.append(ws_read(read))
+        assert sock.recv(1) == b"", "connection stays open after Close"
+        return response, frames[:2] + frames[3:]
+
+
+def websocket_h2(port, host):
+    """An RFC 8441 WebSocket over HTTP/2; returns (status, fields, frames)."""
+    context = ssl._create_unverified_context()
+    context.set_alpn_protocols(["h2"])
+    with context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=5),
+                             server_hostname=host) as sock:
+        connection = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True))
+        connection.initiate_connection()
+        sock.sendall(connection.data_to_send())
+        received = bytearray()
+        state = {"fields": None, "ended": False}
+
+        def pump(until):
+            while not until():
+                data = sock.recv(65536)
+                if not data:
+                    raise ConnectionError("closed")
+                for event in connection.receive_data(data):
+                    if isinstance(event, h2.events.ResponseReceived):
+                        state["fields"] = dict(event.headers)
+                    elif isinstance(event, h2.events.DataReceived):
+                        received.extend(event.data)
+                        connection.acknowledge_received_data(event.flow_controlled_length, 1)
+                    elif isinstance(event, (h2.events.StreamEnded, h2.events.StreamReset)):
+                        state["ended"] = True
+                sock.sendall(connection.data_to_send())
+
+        pump(lambda: connection.remote_settings.get(
+            h2.settings.SettingCodes.ENABLE_CONNECT_PROTOCOL, 0) == 1)
+        connection.send_headers(1, [(":method", "CONNECT"), (":protocol", "websocket"),
+                                    (":scheme", "https"), (":path", "/ws"),
+                                    (":authority", host), ("sec-websocket-version", "13"),
+                                    ("sec-websocket-protocol", "chat")])
+        sock.sendall(connection.data_to_send())
+        pump(lambda: state["fields"] is not None)
+        fields = {name.decode(): value.decode() for name, value in state["fields"].items()}
+        frames = []
+
+        def frame():
+            def complete():
+                try:
+                    ws_read(bytes_reader(bytes(received)))
+                    return True
+                except (IndexError, ValueError, struct.error):
+                    return False
+            pump(complete)
+            consumed = bytes_reader(bytes(received))
+            result = ws_read(consumed)
+            del received[:consumed.offset]
+            return result
+
+        frames.append(frame())
+        connection.send_data(1, ws_frame(1, b"over h2", mask=True))
+        sock.sendall(connection.data_to_send())
+        frames.append(frame())
+        connection.send_data(1, ws_frame(8, struct.pack(">H", 1000), mask=True))
+        sock.sendall(connection.data_to_send())
+        frames.append(frame())
+        return fields[":status"], fields, frames
+
+
+class bytes_reader:
+    """read(count) over a bytes value; ValueError when it runs short."""
+
+    def __init__(self, data):
+        self.data, self.offset = data, 0
+
+    def __call__(self, count):
+        if self.offset + count > len(self.data):
+            raise ValueError("short")
+        self.offset += count
+        return self.data[self.offset - count:self.offset]
 
 
 class Backend(http.server.ThreadingHTTPServer):
@@ -612,6 +814,62 @@ root = "public"
     check_config(work, '[defaults]\n[defaults.proxy]\nupstream = "http://127.0.0.1:0"\n',
                  "proxy upstream port")
     print("Reverse proxy forwarding, framing, limits, failures, and HTTP/2: PASS")
+
+
+def test_websocket_proxy(work):
+    port, tls_port = free_ports(2)
+    backend = Backend(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    cert, key = make_certificate(work, "websocket")
+    config = work / "websocket.toml"
+    config.write_text(f'''[defaults]
+access_log = "logs/websocket.log"
+[defaults.http]
+port = {port}
+[defaults.tls]
+port = {tls_port}
+certificate = "{cert}"
+private_key = "{key}"
+
+[[server]]
+name = "app"
+server_names = ["app.test"]
+[server.proxy]
+upstream = "http://127.0.0.1:{backend.server_address[1]}"
+timeout_ms = 1000
+
+[[server]]
+name = "static"
+root = "public"
+''')
+    with running(work, config) as server:
+        server.ready(port)
+        for tls in (False, True):
+            head, frames = websocket_h1(tls_port if tls else port, "app.test", tls=tls)
+            assert head.startswith("HTTP/1.1 101 "), head
+            assert "sec-websocket-protocol: chat" in head.lower(), head
+            scheme = "https" if tls else "http"
+            # Extensions are not negotiated through the proxy.
+            assert frames == [(1, f"hello 127.0.0.1 {scheme} https://app.test -".encode()),
+                              (1, b"echo:first"), (8, struct.pack(">H", 1000))], frames
+        head, _ = websocket_h1(port, "app.test", "/ws-deny")
+        assert head.startswith("HTTP/1.1 403 "), head
+        head, _ = websocket_h1(port, "app.test", "/ws-bad")
+        assert head.startswith("HTTP/1.1 502 "), head
+        # Ordinary requests still work on the same server.
+        assert fetch(port, "/echo", {"Host": "app.test"})[0] == 200
+        note = ""
+        if h2:
+            status, fields, frames = websocket_h2(tls_port, "app.test")
+            assert status == "200" and fields.get("sec-websocket-protocol") == "chat", fields
+            assert frames == [(1, b"hello 127.0.0.1 https - -"), (1, b"echo:over h2"),
+                              (8, struct.pack(">H", 1000))], frames
+        else:
+            note = " (HTTP/2 check skipped: Python h2 missing)"
+        lines = wait_for_lines(work / "logs" / "websocket.log", 5)
+        assert any('"GET /ws HTTP/1.1" 101' in line for line in lines), lines
+    backend.shutdown()
+    print(f"WebSocket proxying over HTTP/1.1, TLS, and HTTP/2: PASS{note}")
 
 
 def test_redirect_keeps_named_host(work):
@@ -828,6 +1086,7 @@ def main(work):
     test_compression(work)
     test_virtual_hosts_and_policies(work)
     test_reverse_proxy(work)
+    test_websocket_proxy(work)
     test_redirect_keeps_named_host(work)
     test_certificate_reload(work)
     test_draining_shutdown(work)
