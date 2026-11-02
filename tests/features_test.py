@@ -596,6 +596,44 @@ root = "public"
     print("Reverse proxy forwarding, framing, limits, failures, and HTTP/2: PASS")
 
 
+def test_redirect_keeps_named_host(work):
+    port, tls_port = free_ports(2)
+    cert, key = make_certificate(work, "redirect")
+    config = work / "redirect.toml"
+    config.write_text(f'''[defaults.http]
+port = {port}
+mode = "redirect"
+redirect_host = "main.test"
+[defaults.tls]
+port = {tls_port}
+certificate = "{cert}"
+private_key = "{key}"
+
+[[server]]
+name = "main"
+root = "public"
+server_names = ["main.test"]
+
+[[server]]
+name = "apps"
+root = "public"
+server_names = ["*.apps.test"]
+''')
+    with running(work, config) as server:
+        server.ready(tls_port, tls=True)
+        cases = [
+            ("main.test", f"https://main.test:{tls_port}/a?b=1"),
+            (f"Movies.Apps.Test.:{port}", f"https://movies.apps.test:{tls_port}/a?b=1"),
+            ("apps.test", f"https://main.test:{tls_port}/a?b=1"),
+            ("evil.test", f"https://main.test:{tls_port}/a?b=1"),
+            ("127.0.0.1", f"https://main.test:{tls_port}/a?b=1"),
+        ]
+        for host, location in cases:
+            status, fields, _ = fetch(port, "/a?b=1", {"Host": host})
+            assert (status, fields["location"]) == (308, location), (host, fields)
+    print("HTTP redirects keep a configured host name: PASS")
+
+
 def test_certificate_reload(work):
     tls_port, h3_port = free_ports(2)
     cert, key = work / "live-cert.pem", work / "live-key.pem"
@@ -772,6 +810,7 @@ def main(work):
     test_compression(work)
     test_virtual_hosts_and_policies(work)
     test_reverse_proxy(work)
+    test_redirect_keeps_named_host(work)
     test_certificate_reload(work)
     test_draining_shutdown(work)
     test_encrypted_http3_key(work)

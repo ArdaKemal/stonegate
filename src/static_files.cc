@@ -684,7 +684,9 @@ auto respond(eventloop::event_loop& loop, eventloop::http::request& request,
     try {
         if (!context.redirect_origin.empty()) {
             answer.status = 308;
-            std::string location = context.redirect_origin;
+            const auto host = context.sites->named_host(request.authority());
+            std::string location = host.empty() ? context.redirect_origin
+                                                : "https://" + host + context.redirect_port;
             location += request.path();
             if (!request.query().empty()) location.append("?").append(request.query());
             answer.add("location", location);
@@ -720,21 +722,46 @@ auto healthz(eventloop::event_loop& loop, eventloop::http::request& request,
 
 } // namespace
 
-auto site_group::select(std::string_view authority) const noexcept -> const site&
+namespace {
+
+// The host of an authority without its port or a trailing dot.
+[[nodiscard]] auto authority_host(std::string_view authority) noexcept -> std::string_view
 {
-    // Drop the port and a trailing dot; compare without case.
     auto host = authority;
     if (host.starts_with('[')) host = host.substr(0, host.find(']') + 1);
     else if (const auto colon = host.rfind(':'); colon != std::string_view::npos &&
              host.find(':') == colon)
         host = host.substr(0, colon);
     if (host.ends_with('.')) host.remove_suffix(1);
+    return host;
+}
+
+} // namespace
+
+auto site_group::select(std::string_view authority) const noexcept -> const site&
+{
+    const auto* matched = match(authority_host(authority));
+    return matched ? *matched : sites[fallback];
+}
+
+auto site_group::named_host(std::string_view authority) const -> std::string
+{
+    const auto host = authority_host(authority);
+    if (match(host) == nullptr) return {};
+    std::string result(host);
+    std::ranges::transform(result, result.begin(), lower);
+    return result;
+}
+
+// Compares without case: an exact name first, then the longest wildcard.
+auto site_group::match(std::string_view host) const noexcept -> const site*
+{
     const site* wildcard = nullptr;
     std::size_t wildcard_size = 0;
     for (const auto& candidate : sites) {
         for (const auto& name : candidate.settings->server_names) {
             if (!name.starts_with("*.")) {
-                if (equal_lowercase(host, name)) return candidate;
+                if (equal_lowercase(host, name)) return &candidate;
                 continue;
             }
             const auto suffix = std::string_view(name).substr(1);
@@ -745,7 +772,7 @@ auto site_group::select(std::string_view authority) const noexcept -> const site
             }
         }
     }
-    return wildcard ? *wildcard : sites[fallback];
+    return wildcard;
 }
 
 auto make_router(const listener_context& context) -> std::shared_ptr<const eventloop::http::router>

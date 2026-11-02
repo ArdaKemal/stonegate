@@ -61,7 +61,8 @@ The [configuration reference](docs/configuration.md) gives every setting,
 bound, and rule.
 
 - **Virtual hosts**: servers on the same ports are picked by `server_names`
-  (exact names, then `*.domain` wildcards, then a default). One certificate
+  (exact names, then `*.domain` wildcards, then a default). HTTP-to-HTTPS
+  redirects keep a configured host name. One certificate
   per TLS listener; use a SAN or wildcard certificate across names.
 - **Reverse proxy**: a server with `[server.proxy] upstream =
   "http://127.0.0.1:8096"` forwards every request to that HTTP/1.1
