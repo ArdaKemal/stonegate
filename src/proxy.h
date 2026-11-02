@@ -32,7 +32,9 @@ struct proxy_outcome {
 // X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-For ending in the peer
 // address, and X-Real-IP holding client_address(). A client's own
 // X-Forwarded-For and Forwarded fields are kept only when real_ip_header is
-// set, which marks Stonegate as running behind a trusted proxy. Request bodies
+// set, which marks Stonegate as running behind a trusted proxy. WebSocket
+// requests on any protocol become HTTP/1.1 Upgrade handshakes upstream and,
+// once it answers 101, a byte relay in both directions. Request bodies
 // above proxy_max_request_body answer 413. An unreachable or invalid upstream
 // answers 502, and a connect or response head timeout 504. A failure after
 // the response has started abandons it. The site's headers replace upstream

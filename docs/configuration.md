@@ -158,8 +158,20 @@ sends a malformed head answers 502; a connect or response-head timeout
 answers 504; a stalled or invalid request body answers 408 or 400. These
 local answers carry a short text body. A failure after the response has
 started abandons it: HTTP/1.1 closes the connection, and HTTP/2 and HTTP/3
-reset the stream. WebSocket and other upgrades are not forwarded. Writes to
-a slow client are not timed, as for files.
+reset the stream. Writes to a slow client are not timed, as for files.
+
+**WebSockets.** An HTTP/1.1 `Upgrade: websocket` request, or an HTTP/2 or
+HTTP/3 Extended CONNECT with `:protocol` websocket, opens an HTTP/1.1
+WebSocket handshake upstream: `GET` with the same path, query, and fields,
+Stonegate's own `Sec-WebSocket-Key`, and no `Sec-WebSocket-Extensions`, so
+no extension is negotiated. When the upstream answers 101 with the matching
+`Sec-WebSocket-Accept`, Stonegate accepts the client's WebSocket with the
+subprotocol the upstream chose and relays frames unchanged in both
+directions, with no timeout on either side's reads, until one side closes;
+the other side is then closed. Any other answer is relayed as an ordinary
+response (for example a 401 or 403), and a 101 that does not complete the
+handshake answers 502. The access log records 101 and the bytes sent to the
+client when the WebSocket ends.
 
 ## Responses
 
