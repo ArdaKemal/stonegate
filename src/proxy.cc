@@ -5,6 +5,9 @@
 #include "eventloop/task_composition.h"
 #include "eventloop/tcp_stream.h"
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -41,11 +44,9 @@ constexpr std::size_t max_chunk_line = 4096;
 // Request fields the proxy sets itself or that apply to one connection only.
 constexpr std::string_view dropped_request_fields[] {
     "connection", "content-length", "expect", "host", "http2-settings", "keep-alive",
-    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host",
-    "x-forwarded-proto",
+    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-for",
+    "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
 };
-// Client address fields, forwarded only behind a trusted proxy.
-constexpr std::string_view address_fields[] {"forwarded", "x-forwarded-for", "x-real-ip"};
 constexpr std::string_view dropped_response_fields[] {
     "connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding",
     "upgrade",
@@ -103,6 +104,16 @@ template<typename T>
     std::string result(text);
     std::ranges::transform(result, result.begin(), lower);
     return result;
+}
+
+[[nodiscard]] auto format_address(const eventloop::ip_endpoint& endpoint) -> std::string
+{
+    std::array<char, INET6_ADDRSTRLEN> text {};
+    const int family = endpoint.address_family == eventloop::ip_endpoint::family::ipv4
+        ? AF_INET : AF_INET6;
+    if (::inet_ntop(family, endpoint.address.data(), text.data(), text.size()) == nullptr)
+        return {};
+    return text.data();
 }
 
 // The upstream stream, closed when the exchange ends. The hold keeps it valid
@@ -251,6 +262,7 @@ auto build_head(exchange& state, bool secure, std::optional<std::uint64_t> lengt
     for (const auto& field : request.headers())
         if (equal_lowercase(field.name, "connection")) connection.append(field.value).append(",");
     const bool trusted = !settings.real_ip_header.empty();
+    std::string forwarded_for;
     auto& head = state.head;
     head.reserve(1024);
     head.append(request.method_name()).append(" ").append(request.path());
@@ -266,8 +278,13 @@ auto build_head(exchange& state, bool secure, std::optional<std::uint64_t> lengt
         const auto name = lowercase(field.name);
         if (name.empty() || name.front() == ':' || !is_token(name) ||
             !is_field_value(field.value) || std::ranges::contains(dropped_request_fields, name) ||
-            (!trusted && std::ranges::contains(address_fields, name)) || lists(connection, name))
+            (!trusted && name == "forwarded") || lists(connection, name)) {
+            if (trusted && name == "x-forwarded-for" && is_field_value(field.value)) {
+                if (!forwarded_for.empty()) forwarded_for += ", ";
+                forwarded_for += trim(field.value);
+            }
             continue;
+        }
         // HTTP/2 and HTTP/3 may split cookies; HTTP/1.1 takes one field.
         if (name == "cookie") {
             if (!cookies.empty()) cookies += "; ";
@@ -278,6 +295,15 @@ auto build_head(exchange& state, bool secure, std::optional<std::uint64_t> lengt
     }
     if (!cookies.empty()) head.append("cookie: ").append(cookies).append("\r\n");
     head.append("x-forwarded-proto: ").append(secure ? "https" : "http").append("\r\n");
+    if (const auto peer = request.peer()) {
+        if (!forwarded_for.empty()) forwarded_for += ", ";
+        forwarded_for += format_address(*peer);
+    }
+    if (!forwarded_for.empty())
+        head.append("x-forwarded-for: ").append(forwarded_for).append("\r\n");
+    if (const auto client = client_address(request, settings.real_ip_header);
+        !client.empty() && is_field_value(client))
+        head.append("x-real-ip: ").append(client).append("\r\n");
     if (!authority.empty() && is_field_value(authority))
         head.append("x-forwarded-host: ").append(authority).append("\r\n");
     if (length) head.append("content-length: ").append(std::to_string(*length)).append("\r\n");
@@ -608,6 +634,17 @@ auto forward(eventloop::event_loop& loop, exchange& state, bool secure)
 }
 
 } // namespace
+
+auto client_address(const eventloop::http::request& request, std::string_view real_ip_header)
+    -> std::string
+{
+    if (!real_ip_header.empty())
+        if (const auto value = request.header_value(real_ip_header))
+            if (const auto first = trim(value->substr(0, value->find(','))); !first.empty())
+                return std::string(first);
+    if (const auto peer = request.peer()) return format_address(*peer);
+    return {};
+}
 
 auto proxy_request(eventloop::event_loop& loop, eventloop::http::request& request,
                    eventloop::http::response& response, const site& target, bool secure)

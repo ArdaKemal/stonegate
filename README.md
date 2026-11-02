@@ -71,7 +71,8 @@ bound, and rule.
   body limits, and 502/504 answers are per server.
 - **Access logs**: Combined Log Format plus host and duration, per server or
   shared, written by a background thread with a bounded buffer.
-  `real_ip_header` logs the client address from a trusted proxy's field.
+  Clients are logged by address, or by a trusted proxy's field with
+  `real_ip_header`.
 - **Compression**: precompressed `FILE.br`/`FILE.gz`, and gzip while sending
   for text, JSON, XML, JavaScript, and SVG, with `Vary` and separate ETags.
 - **Policies**: `Cache-Control` by path prefix or extension, extra headers
@@ -108,9 +109,8 @@ Stonegate runs as, since reloads happen after the switch.
 
 - No SNI: one certificate per TLS listener, as eventloop's `https_server` and
   `http3_server` take one each.
-- The client address is not available from eventloop's request API; logs
-  show `-` unless `real_ip_header` is set behind a proxy, and proxied
-  applications see Stonegate's address instead of the client's.
+- Proxied applications receive the client address in `X-Forwarded-For` and
+  `X-Real-IP`; they must trust Stonegate's address as a proxy to use it.
 - The proxy opens one upstream connection per request, speaks plain HTTP/1.1
   to numeric addresses only, and does not forward WebSocket upgrades.
 - A reload closes HTTP/3 connections (clients reconnect) and may reset a TCP
@@ -137,7 +137,8 @@ ranges, listings, traversal, and CLI/config equivalence (HTTP/2 and HTTP/3
 checks need a curl with them). `stonegate_configuration` covers the schema,
 includes, inheritance, timeouts, workers, and startup cleanup.
 `stonegate_features` covers access logs and their rotation, compression,
-virtual hosts, policies and error pages, the reverse proxy (framing, limits,
-upstream failures and resets, HTTP/2), certificate reload (including a
-failed one), draining shutdown, encrypted HTTP/3 keys, and account checks.
+virtual hosts, policies and error pages, HTTPS redirects, the reverse proxy
+(framing, limits, upstream failures and resets, client addresses, HTTP/2),
+certificate reload (including a failed one), draining shutdown, encrypted
+HTTP/3 keys, and account checks.
 They need Python 3, the OpenSSL CLI, and curl.

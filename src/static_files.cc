@@ -620,8 +620,7 @@ auto append_escaped(std::string& line, std::string_view text) -> void
 
 // One Combined Log Format line, followed by the host and seconds taken:
 // client - - [time] "METHOD target PROTOCOL" status bytes "referer"
-// "user-agent" "host" seconds. The client is "-" unless real_ip_header names
-// a field, whose first entry is used.
+// "user-agent" "host" seconds. The client is client_address(), or "-".
 auto log_request(const site& selected, const eventloop::http::request& request, unsigned status,
                  std::optional<std::uint64_t> bytes, std::chrono::steady_clock::time_point start)
     -> void
@@ -630,11 +629,7 @@ auto log_request(const site& selected, const eventloop::http::request& request, 
     try {
         std::string line;
         line.reserve(256);
-        std::string_view client;
-        if (!selected.settings->real_ip_header.empty())
-            if (const auto value = request.header_value(selected.settings->real_ip_header))
-                client = trim(value->substr(0, value->find(',')));
-        append_escaped(line, client);
+        append_escaped(line, client_address(request, selected.settings->real_ip_header));
         line += " - - [";
         line += log_time();
         line += "] \"";

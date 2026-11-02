@@ -128,10 +128,15 @@ connection-specific ones (`connection` and the fields it names, `keep-alive`,
 `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
 `http2-settings`) and `expect`. Split HTTP/2 and HTTP/3 cookies are joined
 into one field. Stonegate sets `x-forwarded-proto` (`http`, or `https` on
-TLS and HTTP/3) and `x-forwarded-host`, replacing client values. Client
-`x-forwarded-for`, `forwarded`, and `x-real-ip` fields are removed unless
-`real_ip_header` is set, which marks Stonegate as running behind a trusted
-proxy. Stonegate does not know the client address, so it adds none.
+TLS and HTTP/3) and `x-forwarded-host`, replacing client values. It sets
+`x-forwarded-for` to the connection's peer address and `x-real-ip` to the
+client address as logged (see [Access logs](#access-logs)). A client's own
+`x-forwarded-for` and `forwarded` fields are removed unless `real_ip_header`
+is set, which marks Stonegate as running behind a trusted proxy; then the
+peer address is appended to the incoming `x-forwarded-for` list, and
+`forwarded` passes. A client `x-real-ip` is always replaced. Configure the
+application to trust Stonegate's address (127.0.0.1 for a local upstream)
+as a proxy, so it reads the client from these fields.
 
 A body with a declared length is forwarded with that length; one without
 (HTTP/1.1 chunked, or HTTP/2 and HTTP/3 without `content-length`) is
@@ -214,9 +219,10 @@ and the seconds taken:
 203.0.113.7 - - [18/Oct/2026:13:05:01 +0000] "GET /a.css HTTP/2" 200 512 "https://site/" "curl/8" "site" 0.001
 ```
 
-eventloop does not expose the peer address, so the client field is `-`
-unless `real_ip_header` names a field set by a trusted proxy; its first
-comma-separated entry is logged. Times are UTC. Quotes, backslashes, and
+The client field is the connection's peer address: the TCP peer, or the
+QUIC connection's current address. When `real_ip_header` names a field set
+by a trusted proxy and the request has it, its first comma-separated entry
+is logged instead. The field is `-` when neither is known. Times are UTC. Quotes, backslashes, and
 non-printing bytes are written as `\xHH`. The byte count is the body sent
 (0 for HEAD and 304), or `-` when sending failed. Servers may share a log
 file. Workers append lines to memory, and one thread writes every log at

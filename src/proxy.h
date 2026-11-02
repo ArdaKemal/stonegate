@@ -9,6 +9,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <string_view>
 
 namespace stonegate {
 
@@ -18,11 +20,19 @@ struct proxy_outcome {
     std::optional<std::uint64_t> bytes;
 };
 
+// The client address Stonegate logs and forwards: the first entry of the
+// real_ip_header field when that is set and present, else the connection's
+// peer address, else empty.
+[[nodiscard]] auto client_address(const eventloop::http::request& request,
+                                  std::string_view real_ip_header) -> std::string;
+
 // Forwards a request to the site's HTTP/1.1 upstream over a new connection
 // and streams the response back. The request keeps its method, target, and
 // fields, minus connection-specific ones; the upstream also receives
-// X-Forwarded-Proto and X-Forwarded-Host. Client X-Forwarded-For, Forwarded,
-// and X-Real-IP fields pass only when real_ip_header is set. Request bodies
+// X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-For ending in the peer
+// address, and X-Real-IP holding client_address(). A client's own
+// X-Forwarded-For and Forwarded fields are kept only when real_ip_header is
+// set, which marks Stonegate as running behind a trusted proxy. Request bodies
 // above proxy_max_request_body answer 413. An unreachable or invalid upstream
 // answers 502, and a connect or response head timeout 504. A failure after
 // the response has started abandons it. The site's headers replace upstream
