@@ -578,30 +578,10 @@ auto next_line(eventloop::event_loop& loop, exchange& state)
 }
 
 // Streams the response body from the upstream to the client.
-auto relay_body(eventloop::event_loop& loop, exchange& state) -> eventloop::task<void_result>
+// Decodes a chunked response body for the client. Its own frame keeps
+// relay_body's small.
+auto relay_chunked(eventloop::event_loop& loop, exchange& state) -> eventloop::task<void_result>
 {
-    if (state.body == framing::none) co_return void_result {};
-    if (state.body != framing::chunked) {
-        const bool counted = state.body == framing::length;
-        for (;;) {
-            auto available = state.end - state.start;
-            if (counted) available = static_cast<std::size_t>(
-                std::min<std::uint64_t>(available, state.remaining));
-            if (available != 0) {
-                if (auto written = flatten_result(co_await write_client(loop, state, available));
-                    !written)
-                    co_return written;
-                if (counted) state.remaining -= available;
-            }
-            if (counted && state.remaining == 0) co_return void_result {};
-            const auto read = flatten_result(co_await fill(loop, state));
-            if (!read) co_return std::unexpected(read.error());
-            if (*read == 0) {
-                if (counted) co_return failure(std::errc::bad_message);
-                co_return void_result {};
-            }
-        }
-    }
     for (;;) {
         const auto line = flatten_result(co_await next_line(loop, state));
         if (!line) co_return std::unexpected(line.error());
@@ -635,6 +615,32 @@ auto relay_body(eventloop::event_loop& loop, exchange& state) -> eventloop::task
         const auto line = flatten_result(co_await next_line(loop, state));
         if (!line) co_return std::unexpected(line.error());
         if (line->empty()) co_return void_result {};
+    }
+}
+
+auto relay_body(eventloop::event_loop& loop, exchange& state) -> eventloop::task<void_result>
+{
+    if (state.body == framing::none) co_return void_result {};
+    if (state.body == framing::chunked)
+        co_return flatten_result(co_await relay_chunked(loop, state));
+    const bool counted = state.body == framing::length;
+    for (;;) {
+        auto available = state.end - state.start;
+        if (counted) available = static_cast<std::size_t>(
+            std::min<std::uint64_t>(available, state.remaining));
+        if (available != 0) {
+            if (auto written = flatten_result(co_await write_client(loop, state, available));
+                !written)
+                co_return written;
+            if (counted) state.remaining -= available;
+        }
+        if (counted && state.remaining == 0) co_return void_result {};
+        const auto read = flatten_result(co_await fill(loop, state));
+        if (!read) co_return std::unexpected(read.error());
+        if (*read == 0) {
+            if (counted) co_return failure(std::errc::bad_message);
+            co_return void_result {};
+        }
     }
 }
 
@@ -709,6 +715,23 @@ auto reply_status(eventloop::event_loop& loop, exchange& state, unsigned status)
     co_return proxy_outcome {status, state.request.method() == method_type::head ? 0 : text.size()};
 }
 
+// Sends the upstream response to the client. A failure abandons it, which
+// closes the client connection on HTTP/1.1 and resets the stream on HTTP/2
+// and HTTP/3. Its own frame keeps forward's small.
+auto relay_response(eventloop::event_loop& loop, exchange& state)
+    -> eventloop::task<proxy_outcome>
+{
+    state.views.clear();
+    for (const auto& [name, value] : state.fields) state.views.push_back({name, value});
+    const auto failed = proxy_outcome {state.status, std::nullopt};
+    if (!flatten_result(co_await state.response.async_start(state.status, state.views)))
+        co_return failed;
+    if (!flatten_result(co_await relay_body(loop, state))) co_return failed;
+    if (!flatten_result(co_await state.response.async_finish())) co_return failed;
+    co_return proxy_outcome {state.status, state.request.method() == method_type::head
+                                               ? 0 : state.sent};
+}
+
 // Forwards the request; an unexpected status is answered locally.
 auto forward(eventloop::event_loop& loop, exchange& state, bool secure)
     -> eventloop::task<step<proxy_outcome>>
@@ -744,17 +767,8 @@ auto forward(eventloop::event_loop& loop, exchange& state, bool secure)
     if (const auto received = settle(co_await receive_head(loop, state)); !received)
         co_return std::unexpected(received.error());
     if (state.status == 101) co_return settle(co_await tunnel(loop, state));
-    state.views.clear();
-    for (const auto& [name, value] : state.fields) state.views.push_back({name, value});
-    const auto failed = proxy_outcome {state.status, std::nullopt};
-    if (!flatten_result(co_await state.response.async_start(state.status, state.views)))
-        co_return failed;
-    // A failure from here on abandons the response, which closes the client
-    // connection on HTTP/1.1 and resets the stream on HTTP/2 and HTTP/3.
-    if (!flatten_result(co_await relay_body(loop, state))) co_return failed;
-    if (!flatten_result(co_await state.response.async_finish())) co_return failed;
-    co_return proxy_outcome {state.status, state.request.method() == method_type::head
-                                               ? 0 : state.sent};
+    const auto relayed = co_await relay_response(loop, state);
+    co_return relayed ? *relayed : proxy_outcome {state.status, std::nullopt};
 }
 
 } // namespace
