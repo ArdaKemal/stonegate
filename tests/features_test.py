@@ -11,6 +11,7 @@ import http.client
 import http.server
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -24,6 +25,8 @@ import time
 
 SERVER = str(pathlib.Path(sys.argv[1]).resolve())
 CURL = shutil.which("curl")
+# eventloop's HTTP/3 client, when the build provides it; used if curl lacks HTTP/3.
+HTTP3_CLIENT = os.environ.get("STONEGATE_HTTP3_CLIENT")
 try:
     import h2.config
     import h2.connection
@@ -73,6 +76,33 @@ def certificate_der(path):
 def openssl(*arguments):
     result = subprocess.run(["openssl", *arguments], capture_output=True, text=True)
     assert result.returncode == 0, (arguments, result.stderr)
+
+
+def http3_available():
+    return CURL_H3 or bool(HTTP3_CLIENT)
+
+
+def http3_get(port, path, cert, host="localhost", extra_paths=(), output=None):
+    """GETs https://host:port/path over HTTP/3, connecting to 127.0.0.1 for
+    localhost. Returns (status, body); with extra_paths, every path goes over
+    one connection and bodies land in output instead."""
+    if CURL_H3 and not extra_paths:
+        result = subprocess.run(
+            [CURL, "--http3-only", "--silent", "--show-error", "--noproxy", "*", "--max-time", "10",
+             "--cacert", str(cert), "--resolve", f"{host}:{port}:127.0.0.1",
+             "--write-out", "\n%{http_code}", f"https://{host}:{port}{path}"],
+            capture_output=True, timeout=15)
+        body, _, status = result.stdout.rpartition(b"\n")
+        return (int(status) if status.isdigit() else 0), body
+    command = [HTTP3_CLIENT, "--ca-file", str(cert), "--timeout-ms", "10000"]
+    for extra in extra_paths:
+        command += ["--request-path", extra]
+    if output:
+        command += ["--output-dir", str(output)]
+    result = subprocess.run(command + [f"https://{host}:{port}{path}"], capture_output=True,
+                            timeout=30)
+    statuses = [int(found) for found in re.findall(rb"HTTP/3 (\d{3})", result.stderr)]
+    return (statuses[-1] if statuses else 0), result.stdout
 
 
 def make_certificate(directory, name, password=None):
@@ -951,6 +981,69 @@ root = "public"
     print("ACME HTTP-01 challenges before redirects and proxying: PASS")
 
 
+def test_http3_proxy(work):
+    if not http3_available():
+        print("HTTP/3 static files and proxying: SKIPPED (no HTTP/3 client)")
+        return
+    port, tls_port = free_ports(2)
+    backend = Backend(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    cert, key = work / "h3-cert.pem", work / "h3-key.pem"
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost,DNS:static.localhost,IP:127.0.0.1",
+            "-keyout", str(key), "-out", str(cert))
+    config = work / "http3.toml"
+    config.write_text(f'''[defaults.http]
+port = {port}
+[defaults.tls]
+port = {tls_port}
+certificate = "{cert}"
+private_key = "{key}"
+[defaults.http3]
+port = {tls_port}
+connections = 32
+
+[[server]]
+name = "app"
+server_names = ["localhost"]
+[server.proxy]
+upstream = "http://127.0.0.1:{backend.server_address[1]}"
+timeout_ms = 2000
+
+[[server]]
+name = "static"
+root = "public"
+''')
+    with running(work, config) as server:
+        server.ready(port)
+        server.wait_for("HTTP/3 on UDP")
+        assert http3_get(tls_port, "/", cert, host="127.0.0.1") == (200, b"website\n")
+        status, body = http3_get(tls_port, "/echo?q=1", cert)
+        text = body.decode()
+        assert status == 200 and text.startswith("GET /echo?q=1\n"), (status, text)
+        for line in ("x-forwarded-proto: https", "x-forwarded-for: 127.0.0.1",
+                     f"x-forwarded-host: localhost:{tls_port}"):
+            assert line in text.splitlines(), (line, text)
+        assert http3_get(tls_port, "/big", cert) == (200, Upstream.big)
+        assert http3_get(tls_port, "/garbage", cert)[0] == 502
+        if HTTP3_CLIENT:
+            output = work / "h3-multi"
+            status, _ = http3_get(tls_port, "/", cert, extra_paths=("/echo", "/chunked", "/big"),
+                                  output=output)
+            assert status == 200 and len(list(output.iterdir())) == 3, list(output.iterdir())
+        results = []
+        def slow():
+            results.append(http3_get(tls_port, "/slow?s=0.3", cert)[0])
+        workers = [threading.Thread(target=slow) for _ in range(12)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        assert results == [200] * 12, results
+    backend.shutdown()
+    print("HTTP/3 static files and proxying: PASS")
+
+
 def test_redirect_keeps_named_host(work):
     port, tls_port = free_ports(2)
     cert, key = make_certificate(work, "redirect")
@@ -1034,12 +1127,8 @@ port = {h3_port}
         # A connection opened before the reload keeps working.
         assert fetch(tls_port, "/", connection=kept)[0] == 200
         kept.close()
-        if CURL_H3:
-            result = subprocess.run([CURL, "--http3-only", "--silent", "--show-error", "--fail",
-                                     "--max-time", "5", "--cacert", str(second_cert), "--resolve",
-                                     f"localhost:{h3_port}:127.0.0.1", f"https://localhost:{h3_port}/"],
-                                    capture_output=True, timeout=10)
-            assert result.returncode == 0 and result.stdout == b"website\n", result.stderr
+        if http3_available():
+            assert http3_get(h3_port, "/", second_cert) == (200, b"website\n")
 
         # A broken key leaves the working certificate in place.
         key.write_text("not a key\n")
@@ -1048,7 +1137,7 @@ port = {h3_port}
         assert peer_certificate(tls_port) == certificate_der(second_cert)
         assert fetch(tls_port, "/", tls=True)[0] == 200
     print("SIGHUP certificate reload, kept connections, and failed reload: PASS"
-          + ("" if CURL_H3 else " (HTTP/3 check skipped: curl lacks HTTP3)"))
+          + ("" if http3_available() else " (HTTP/3 check skipped: no HTTP/3 client)"))
 
 
 def test_draining_shutdown(work):
@@ -1129,15 +1218,11 @@ port = {h3_port}
     check_config(work, config.read_text().replace("PRIVATE_SENTINEL_739", "wrong"), "server")
     with running(work, config) as server:
         server.ready(tls_port, tls=True)
-        if CURL_H3:
-            result = subprocess.run([CURL, "--http3-only", "--silent", "--show-error", "--fail",
-                                     "--max-time", "5", "--cacert", str(cert), "--resolve",
-                                     f"localhost:{h3_port}:127.0.0.1", f"https://localhost:{h3_port}/"],
-                                    capture_output=True, timeout=10)
-            assert result.returncode == 0 and result.stdout == b"website\n", result.stderr
+        if http3_available():
+            assert http3_get(h3_port, "/", cert) == (200, b"website\n")
         assert "PRIVATE_SENTINEL_739" not in server.text()
     print("Encrypted private key on TLS and HTTP/3: PASS"
-          + ("" if CURL_H3 else " (HTTP/3 request skipped: curl lacks HTTP3)"))
+          + ("" if http3_available() else " (HTTP/3 request skipped: no HTTP/3 client)"))
 
 
 def test_account_switch(work):
@@ -1172,6 +1257,7 @@ def main(work):
     test_virtual_hosts_and_policies(work)
     test_reverse_proxy(work)
     test_websocket_proxy(work)
+    test_http3_proxy(work)
     test_redirect_keeps_named_host(work)
     test_acme_challenge(work)
     test_certificate_reload(work)
