@@ -664,6 +664,38 @@ auto log_request(const site& selected, const eventloop::http::request& request, 
     }
 }
 
+// Whether an authority (Host, or :authority) is a host name of letters,
+// digits, '.', '-', and '_', or a bracketed IPv6 literal, with an optional
+// numeric port. Anything else, such as '/', '?', '#', '@', or '\\', could
+// make a redirect Location or an upstream's absolute URLs point elsewhere.
+[[nodiscard]] auto valid_authority(std::string_view authority) noexcept -> bool
+{
+    if (authority.empty() || authority.size() > 255) return authority.empty();
+    std::string_view host = authority, port;
+    if (authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close == std::string_view::npos || close == 1) return false;
+        host = authority.substr(1, close - 1);
+        if (host.find_first_not_of("0123456789abcdefABCDEF:.") != std::string_view::npos)
+            return false;
+        const auto rest = authority.substr(close + 1);
+        if (!rest.empty() && rest.front() != ':') return false;
+        if (!rest.empty()) port = rest.substr(1);
+    } else {
+        const auto colon = authority.find(':');
+        host = authority.substr(0, colon);
+        if (colon != std::string_view::npos) port = authority.substr(colon + 1);
+        if (host.empty() ||
+            host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                   "0123456789.-_") != std::string_view::npos)
+            return false;
+    }
+    if (authority.find(':') != std::string_view::npos && authority.front() != '[' &&
+        port.empty())
+        return false;
+    return port.size() <= 5 && port.find_first_not_of("0123456789") == std::string_view::npos;
+}
+
 // Whether the request is an HTTP-01 challenge this site answers itself.
 [[nodiscard]] auto acme_challenge(const site& selected, const eventloop::http::request& request)
     noexcept -> bool
@@ -713,7 +745,10 @@ auto respond(eventloop::event_loop& loop, eventloop::http::request& request,
     // Challenges come first: Let's Encrypt asks on plain HTTP, and they must
     // reach neither a redirect nor an upstream application.
     const bool challenge = acme_challenge(selected, request);
-    if (selected.upstream && context.redirect_origin.empty() && !challenge) {
+    // A malformed Host is refused before it can reach a redirect, a
+    // challenge, or an upstream application.
+    const bool bad_host = !valid_authority(request.authority());
+    if (selected.upstream && context.redirect_origin.empty() && !challenge && !bad_host) {
         const auto forwarded = co_await proxy_request(loop, request, response, selected,
                                                       context.secure);
         const auto outcome = forwarded ? *forwarded : proxy_outcome {500, std::nullopt};
@@ -722,7 +757,9 @@ auto respond(eventloop::event_loop& loop, eventloop::http::request& request,
     }
     reply answer;
     try {
-        if (challenge) {
+        if (bad_host) {
+            answer = error_reply(selected, 400);
+        } else if (challenge) {
             answer = acme_reply(selected, request.path());
         } else if (!context.redirect_origin.empty()) {
             answer.status = 308;
@@ -789,7 +826,10 @@ auto site_group::select(std::string_view authority) const noexcept -> const site
 auto site_group::named_host(std::string_view authority) const -> std::string
 {
     const auto host = authority_host(authority);
-    if (match(host) == nullptr) return {};
+    if (host.empty() || host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                               "0123456789.-_") != std::string_view::npos ||
+        match(host) == nullptr)
+        return {};
     std::string result(host);
     std::ranges::transform(result, result.begin(), lower);
     return result;
