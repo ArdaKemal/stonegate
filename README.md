@@ -132,8 +132,7 @@ keys readable only to root, so make them readable to Stonegate's account
 - Proxied applications receive the client address in `X-Forwarded-For` and
   `X-Real-IP`; they must trust Stonegate's address as a proxy to use it.
 - The proxy opens one upstream connection per request and speaks plain
-  HTTP/1.1 to numeric addresses only. WebSocket extensions such as
-  permessage-deflate are not negotiated through it.
+  HTTP/1.1 to numeric addresses only.
 - A reload closes HTTP/3 connections (clients reconnect) and may reset a TCP
   connection still waiting in the old listener's backlog. Other settings
   need a restart.

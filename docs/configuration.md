@@ -182,13 +182,16 @@ reset the stream. Writes to a slow client are not timed, as for files.
 
 **WebSockets.** An HTTP/1.1 `Upgrade: websocket` request, or an HTTP/2 or
 HTTP/3 Extended CONNECT with `:protocol` websocket, opens an HTTP/1.1
-WebSocket handshake upstream: `GET` with the same path, query, and fields,
-Stonegate's own `Sec-WebSocket-Key`, and no `Sec-WebSocket-Extensions`, so
-no extension is negotiated. When the upstream answers 101 with the matching
+WebSocket handshake upstream: `GET` with the same path, query, and fields
+(including the client's subprotocol and extension offers) and Stonegate's
+own `Sec-WebSocket-Key`. When the upstream answers 101 with the matching
 `Sec-WebSocket-Accept`, Stonegate accepts the client's WebSocket with the
-subprotocol the upstream chose and relays frames unchanged in both
-directions, with no timeout on either side's reads, until one side closes;
-the other side is then closed. Any other answer is relayed as an ordinary
+subprotocol and extensions the upstream chose and relays frames unchanged
+in both directions, compressed ones included, with no timeout on either
+side's reads, until one side closes. The other side is then closed:
+HTTP/1.1 closes the connection, and HTTP/2 and HTTP/3 end the stream
+(END_STREAM or FIN), waiting up to two seconds for the client to end its
+side before resetting it. Any other answer is relayed as an ordinary
 response (for example a 401 or 403), and a 101 that does not complete the
 handshake answers 502. The access log records 101 and the bytes sent to the
 client when the WebSocket ends.

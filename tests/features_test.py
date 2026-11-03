@@ -492,6 +492,8 @@ class Upstream(http.server.BaseHTTPRequestHandler):
                 f"Sec-WebSocket-Accept: {accept}\r\n")
         if "chat" in offered:
             head += "Sec-WebSocket-Protocol: chat\r\n"
+        if "permessage-deflate" in self.headers.get("sec-websocket-extensions", ""):
+            head += "Sec-WebSocket-Extensions: permessage-deflate\r\n"
         seen = " ".join(self.headers.get(name, "-") for name in (
             "x-real-ip", "x-forwarded-proto", "origin", "sec-websocket-extensions"))
         # The greeting shares a write with the head, so it arrives behind it.
@@ -502,7 +504,9 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             if opcode == 8:
                 self.wfile.write(ws_frame(8, payload))
                 return
-            self.wfile.write(ws_frame(1, b"echo:" + payload))
+            # RSV1 marks a compressed message; report that it arrived intact.
+            prefix = b"rsv1:" if opcode & 0x40 else b"echo:"
+            self.wfile.write(ws_frame(1, prefix + payload))
 
     do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = dispatch
 
@@ -512,11 +516,11 @@ def websocket_accept(key):
     return base64.b64encode(digest).decode()
 
 
-def ws_frame(opcode, payload, mask=False):
+def ws_frame(opcode, payload, mask=False, rsv1=False):
     """One final frame; clients mask, servers do not."""
     size = len(payload)
     bit = 0x80 if mask else 0
-    head = bytes([0x80 | opcode])
+    head = bytes([0x80 | (0x40 if rsv1 else 0) | opcode])
     if size < 126:
         head += bytes([bit | size])
     elif size < 65536:
@@ -531,7 +535,8 @@ def ws_frame(opcode, payload, mask=False):
 
 
 def ws_read(read):
-    """Reads one frame through read(count); returns (opcode, payload)."""
+    """Reads one frame through read(count); returns (opcode, payload), with
+    0x40 added to the opcode when RSV1 is set."""
     first, second = read(2)
     size = second & 0x7F
     if size == 126:
@@ -542,7 +547,7 @@ def ws_read(read):
     payload = read(size) if size else b""
     if key:
         payload = bytes(byte ^ key[index % 4] for index, byte in enumerate(payload))
-    return first & 0x0F, payload
+    return first & 0x4F, payload
 
 
 def exact_reader(sock):
@@ -594,6 +599,8 @@ def websocket_h1(port, host, path="/ws", tls=False):
         sock.sendall(ws_frame(2, large, mask=True))
         frames.append(ws_read(read))
         assert frames[-1] == (1, b"echo:" + large), len(frames[-1][1])
+        sock.sendall(ws_frame(1, b"\xf2\x48\xcd\xc9\xc9\x07\x00", mask=True, rsv1=True))
+        frames.append(ws_read(read))
         sock.sendall(ws_frame(8, struct.pack(">H", 1000), mask=True))
         frames.append(ws_read(read))
         assert sock.recv(1) == b"", "connection stays open after Close"
@@ -610,7 +617,7 @@ def websocket_h2(port, host):
         connection.initiate_connection()
         sock.sendall(connection.data_to_send())
         received = bytearray()
-        state = {"fields": None, "ended": False}
+        state = {"fields": None, "ended": None}
 
         def pump(until):
             while not until():
@@ -623,8 +630,12 @@ def websocket_h2(port, host):
                     elif isinstance(event, h2.events.DataReceived):
                         received.extend(event.data)
                         connection.acknowledge_received_data(event.flow_controlled_length, 1)
-                    elif isinstance(event, (h2.events.StreamEnded, h2.events.StreamReset)):
-                        state["ended"] = True
+                    elif isinstance(event, h2.events.StreamEnded):
+                        state["ended"] = "end_stream"
+                        # A browser ends its side once the server has.
+                        connection.end_stream(1)
+                    elif isinstance(event, h2.events.StreamReset):
+                        state["ended"] = "reset"
                 sock.sendall(connection.data_to_send())
 
         pump(lambda: connection.remote_settings.get(
@@ -658,6 +669,9 @@ def websocket_h2(port, host):
         connection.send_data(1, ws_frame(8, struct.pack(">H", 1000), mask=True))
         sock.sendall(connection.data_to_send())
         frames.append(frame())
+        # After the Close exchange the stream should end, not be reset.
+        pump(lambda: state["ended"] is not None)
+        frames.append(state["ended"])
         return fields[":status"], fields, frames
 
 
@@ -882,10 +896,15 @@ root = "public"
             head, frames = websocket_h1(tls_port if tls else port, "app.test", tls=tls)
             assert head.startswith("HTTP/1.1 101 "), head
             assert "sec-websocket-protocol: chat" in head.lower(), head
+            # The backend's extension choice reaches the client, and a
+            # compressed (RSV1) frame reaches the backend unchanged.
+            assert "sec-websocket-extensions: permessage-deflate\r\n" in head.lower(), head
             scheme = "https" if tls else "http"
-            # Extensions are not negotiated through the proxy.
-            assert frames == [(1, f"hello 127.0.0.1 {scheme} https://app.test -".encode()),
-                              (1, b"echo:first"), (8, struct.pack(">H", 1000))], frames
+            assert frames == [(1, f"hello 127.0.0.1 {scheme} https://app.test permessage-deflate"
+                                  .encode()),
+                              (1, b"echo:first"),
+                              (1, b"rsv1:\xf2\x48\xcd\xc9\xc9\x07\x00"),
+                              (8, struct.pack(">H", 1000))], frames
         head, _ = websocket_h1(port, "app.test", "/ws-deny")
         assert head.startswith("HTTP/1.1 403 "), head
         head, _ = websocket_h1(port, "app.test", "/ws-bad")
@@ -897,7 +916,7 @@ root = "public"
             status, fields, frames = websocket_h2(tls_port, "app.test")
             assert status == "200" and fields.get("sec-websocket-protocol") == "chat", fields
             assert frames == [(1, b"hello 127.0.0.1 https - -"), (1, b"echo:over h2"),
-                              (8, struct.pack(">H", 1000))], frames
+                              (8, struct.pack(">H", 1000)), "end_stream"], frames
         else:
             note = " (HTTP/2 check skipped: Python h2 missing)"
         lines = wait_for_lines(work / "logs" / "websocket.log", 5)

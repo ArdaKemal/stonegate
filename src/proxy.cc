@@ -46,7 +46,7 @@ constexpr std::size_t max_chunk_line = 4096;
 // Request fields the proxy sets itself or that apply to one connection only.
 constexpr std::string_view dropped_request_fields[] {
     "connection", "content-length", "expect", "host", "http2-settings", "keep-alive",
-    "proxy-connection", "sec-websocket-extensions", "sec-websocket-key",
+    "proxy-connection", "sec-websocket-key",
     "sec-websocket-version", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-for",
     "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
 };
@@ -327,6 +327,8 @@ auto build_head(exchange& state, bool secure, std::optional<std::uint64_t> lengt
     std::string cookies;
     for (const auto& field : request.headers()) {
         const auto name = lowercase(field.name);
+        // Extensions apply end to end, so a WebSocket's offers go upstream.
+        if (name == "sec-websocket-extensions" && !websocket) continue;
         if (name.empty() || name.front() == ':' || !is_token(name) ||
             !is_field_value(field.value) || std::ranges::contains(dropped_request_fields, name) ||
             (!trusted && name == "forwarded") || lists(connection, name)) {
@@ -680,18 +682,29 @@ auto upstream_to_client(eventloop::event_loop& loop, exchange& state,
 
 // Accepts the client's WebSocket with the upstream's subprotocol, then relays
 // bytes both ways without a timeout until either side closes; the other
-// direction is then cancelled. WebSocket frames pass unchanged.
+// direction is then cancelled and the client stream closed. WebSocket frames
+// pass unchanged.
 auto tunnel(eventloop::event_loop& loop, exchange& state) -> eventloop::task<step<proxy_outcome>>
 {
-    std::string_view selected;
-    for (const auto& [name, value] : state.fields)
+    std::string_view selected, extensions;
+    for (const auto& [name, value] : state.fields) {
         if (name == "sec-websocket-protocol") selected = value;
-    auto accepted = co_await state.request.async_accept_websocket(selected);
+        if (name == "sec-websocket-extensions") extensions = value;
+    }
+    // Frames, including compressed ones (RSV1), pass through unchanged, so
+    // the extensions the upstream accepted apply between it and the client.
+    auto accepted = co_await state.request.async_accept_websocket(selected, extensions);
     if (!accepted) co_return std::unexpected(500u);
     if (!*accepted) co_return std::unexpected(400u);
     auto& socket = **accepted;
     (void)co_await eventloop::race(client_to_upstream(loop, state, socket),
                                    upstream_to_client(loop, state, socket));
+    // HTTP/2 and HTTP/3 end the stream instead of resetting it: send
+    // END_STREAM or FIN, then give the client a moment to end its side.
+    // HTTP/1.1 closes the connection, as RFC 6455 has the server do first.
+    if (state.request.protocol() != eventloop::http::protocol::http1_1)
+        (void)co_await bounded(loop, socket.async_close(),
+                               std::min(state.timeout, std::chrono::milliseconds {2000}));
     co_return proxy_outcome {101, state.sent};
 }
 
