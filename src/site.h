@@ -36,7 +36,8 @@ struct site_group {
 
     [[nodiscard]] auto select(std::string_view authority) const noexcept -> const site&;
     // The request host, lowercase and without port or trailing dot, when it
-    // matches a server_names entry; empty otherwise.
+    // is a plain host name (letters, digits, '.', '-', '_') matching a
+    // server_names entry; empty otherwise. Redirects build URLs from it.
     [[nodiscard]] auto named_host(std::string_view authority) const -> std::string;
 
 private:

@@ -716,6 +716,10 @@ root = "public"
         assert "198.51.100.1" not in text and "x-drop" not in text, text
         assert fields["x-frame-options"] == "DENY" and "x-hop" not in fields, fields
         assert fetch(port, "/", {"Host": "static.test"})[2] == b"website\n"
+        # A malformed Host never reaches the application.
+        for host in ("evil.com/x", "app.test?x", "a b"):
+            assert fetch(port, "/echo", {"Host": host})[0] == 400, host
+        assert fetch(port, "/echo", {"Host": "[::1]:8080"})[0] in (200, 404)
         # Behind a trusted proxy, its client list is extended and the first
         # entry becomes the real client.
         text = fetch(port, "/echo", {"Host": "trusted.test", "X-Forwarded-For": "198.51.100.1",
@@ -982,6 +986,12 @@ server_names = ["*.apps.test"]
         for host, location in cases:
             status, fields, _ = fetch(port, "/a?b=1", {"Host": host})
             assert (status, fields["location"]) == (308, location), (host, fields)
+        # A malformed Host that ends like a server name must not choose the
+        # redirect target (open redirect); it is refused.
+        for host in ("evil.com/x.apps.test", "evil.com?.apps.test", "evil.com#.apps.test",
+                     "evil.com\\x.apps.test", "user@x.apps.test", "x.apps.test:", "x.apps.test:1:2"):
+            status, fields, _ = fetch(port, "/a", {"Host": host})
+            assert status == 400 and "location" not in fields, (host, status, fields)
     print("HTTP redirects keep a configured host name: PASS")
 
 
