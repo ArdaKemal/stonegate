@@ -121,7 +121,14 @@ if(BUILD_TESTING AND NOT WIN32)
         add_test(NAME stonegate_features
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/features_test.py"
                 $<TARGET_FILE:stonegate>)
-        set_tests_properties(stonegate_features PROPERTIES TIMEOUT 120)
+        set_tests_properties(stonegate_features PROPERTIES TIMEOUT 180)
+        # eventloop's HTTP/3 client exercises HTTP/3 when curl lacks it. It
+        # exists when eventloop is built here from source.
+        if(TARGET http3_client)
+            add_dependencies(stonegate http3_client)
+            set_tests_properties(stonegate_features PROPERTIES
+                ENVIRONMENT "STONEGATE_HTTP3_CLIENT=$<TARGET_FILE:http3_client>")
+        endif()
     endif()
     # The smoke test runs curl and openssl from PATH; HTTP/2 and HTTP/3
     # checks are skipped when that curl lacks them.

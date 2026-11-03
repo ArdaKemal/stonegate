@@ -164,4 +164,6 @@ virtual hosts, policies and error pages, HTTPS redirects, ACME challenges,
 the reverse proxy (framing, limits, upstream failures and resets, client
 addresses, WebSockets, HTTP/2), certificate reload (including a failed
 one), draining shutdown, encrypted HTTP/3 keys, and account checks.
-They need Python 3, the OpenSSL CLI, and curl.
+They need Python 3, the OpenSSL CLI, and curl. HTTP/3 checks use curl when
+it has HTTP/3 and otherwise eventloop's `http3_client`, which is built with
+the tests when eventloop is built from source.
