@@ -141,10 +141,9 @@ keys readable only to root, so make them readable to Stonegate's account
   not logged.
 - HTTP/2 is TLS only. HTTP/3 has no dynamic QPACK, push, or WebTransport.
   No CGI or custom routes.
-- Both projects have libFuzzer harnesses for their parsers (`fuzz/`). So far
-  they have had short local runs (10 to 25 minutes per harness, about 600
-  million inputs in all), which found one bug, now fixed. Longer or
-  continuous fuzzing is still to come.
+- Both projects have libFuzzer harnesses for their parsers (`fuzz/`). Local
+  runs of up to about an hour per harness, some 4 billion inputs in all,
+  found one bug, now fixed. Continuous fuzzing is still to come.
 
 ## Tests
 
